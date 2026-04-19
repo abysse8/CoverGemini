@@ -1,0 +1,9 @@
+__pycache__/
+jobs/
+server_debug.log
+*.pdf
+*.aux
+*.log
+*.out
+.DS_Store
+venv/
