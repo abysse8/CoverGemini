@@ -431,3 +431,15 @@
 }
 
 [2026-04-23 21:20:52] Library source load failed for session 64daf00d-cfa0-4e57-8e63-327a2dc4bd7b, label astek_dc: pypdf is not installed. Run: pip install pypdf
+[2026-04-27 01:15:36] build_library_cache failed for label dc_astek: HTTPSConnectionPool(host='generativelanguage.googleapis.com', port=443): Read timed out. (read timeout=120)
+[2026-04-27 01:19:13] build_library_cache failed for label cv_julien: HTTPSConnectionPool(host='generativelanguage.googleapis.com', port=443): Read timed out. (read timeout=120)
+[2026-04-27 01:48:25] Generating application with 2 context files.
+[2026-04-27 02:00:19] Generating application with 2 context files.
+[2026-04-27 02:00:19] generate failed: Missing OPENAI_API_KEY
+[2026-04-27 02:00:32] Generating application with 2 context files.
+[2026-04-27 02:00:32] generate failed: Missing OPENAI_API_KEY
+[2026-04-27 02:03:30] Generating application with 2 context files.
+[2026-04-27 02:03:30] generate failed: Missing OPENAI_API_KEY
+[2026-04-27 02:11:40] Generating application with 2 context files.
+[2026-04-27 02:46:47] Generating PDF application with 2 context files.
+[2026-04-27 07:52:26] Generating PDF application with 2 context files.

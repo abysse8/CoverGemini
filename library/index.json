@@ -6,6 +6,24 @@
       "stored_name": "astek_dc.pdf",
       "path": "library/astek_dc.pdf",
       "uploaded_at": "2026-04-23T06:36:48"
+    },
+    "dc_astek": {
+      "label": "dc_astek",
+      "original_name": "astek_dc.pdf",
+      "stored_name": "dc_astek.pdf",
+      "path": "library/dc_astek.pdf",
+      "uploaded_at": "2026-04-27T01:13:19",
+      "cached_profile_path": "library/dc_astek.profile.json",
+      "cached_profile_updated_at": ""
+    },
+    "cv_julien": {
+      "label": "cv_julien",
+      "original_name": "CV_2025-12-07_JULIEN_GONZALES.pdf",
+      "stored_name": "cv_julien.pdf",
+      "path": "library/cv_julien.pdf",
+      "uploaded_at": "2026-04-27T01:17:07",
+      "cached_profile_path": "library/cv_julien.profile.json",
+      "cached_profile_updated_at": ""
     }
   }
 }

@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/CoverMaker.iml" filepath="$PROJECT_DIR$/.idea/CoverMaker.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/CoverAI.iml" filepath="$PROJECT_DIR$/.idea/CoverAI.iml" />
     </modules>
   </component>
 </project>
