@@ -4,6 +4,7 @@ import uuid
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -39,7 +40,7 @@ WORKDIR.mkdir(exist_ok=True)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 PDFLATEX       = os.environ.get("PDFLATEX_PATH", "pdflatex")
-SERVER_BASE_URL = os.environ.get("SERVER_BASE_URL", "http://192.168.0.198:9090")
+SERVER_BASE_URL = os.environ.get("SERVER_BASE_URL", "")
 
 MQTT_HOST   = os.environ.get("MQTT_HOST", "localhost")
 MQTT_PORT   = int(os.environ.get("MQTT_PORT", 1883))
@@ -53,6 +54,8 @@ OUTPUT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
+        "company":    {"type": "string"},
+        "role_title": {"type": "string"},
         "letter":    {"type": "string"},
         "objective": {"type": "string"},
         "apl_items": {"type": "array", "items": {"type": "string"}},
@@ -68,7 +71,7 @@ OUTPUT_SCHEMA = {
         },
         "notes": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["letter", "objective", "apl_items", "skills", "notes"],
+    "required": ["company", "role_title", "letter", "objective", "apl_items", "skills", "notes"],
 }
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -170,8 +173,18 @@ def list_dir(path: Path) -> list:
     ]
 
 
+def get_base_url():
+    """Returns the base URL, prioritising environment variable, then the current request's host."""
+    if SERVER_BASE_URL:
+        return SERVER_BASE_URL.rstrip('/')
+    if request:
+        # request.url_root includes scheme and host (e.g., https://xyz.ngrok-free.app/)
+        return request.url_root.rstrip('/')
+    return "http://localhost:9090"
+
+
 def file_url(job_id: str, slot: str, filename: str) -> str:
-    return f"{SERVER_BASE_URL}/jobs/{job_id}/files/{slot}/{filename}"
+    return f"{get_base_url()}/jobs/{job_id}/files/{slot}/{filename}"
 
 
 # ---------------------------------------------------------------------------
@@ -216,8 +229,9 @@ def call_openai(payload: dict) -> dict:
             {"role": "system", "content": (
                 "Tu es CoverAI, un assistant de candidature pour stages en systèmes embarqués et IA appliquée.\n"
                 "Produis uniquement des données sémantiques minimales en JSON. Jamais de commandes LaTeX.\n"
-                "Utilise uniquement les faits présents dans les documents de contexte et dans l'offre.\n"
-                "N'invente rien. La lettre doit être directe, crédible, courte, sans phrases creuses.\n"
+                "Extrais impérativement le nom de l'entreprise ('company') et le titre du poste ('role_title') de l'offre.\n"
+                "Utilise uniquement les faits présents dans les documents de contexte (CV, DC, etc.) et dans l'offre.\n"
+                "N'invente rien. La lettre doit être structurée en exactement 3 paragraphes distincts, professionnelle et percutante.\n"
                 "L'objectif doit tenir en une phrase."
             )},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -234,19 +248,25 @@ def compile_latex(job_id: str, cv_tex: str) -> Path | None:
     tex_path.write_text(cv_tex, encoding="utf-8")
     copy_assets(out_dir)
 
-    cmd = [PDFLATEX, "-interaction=nonstopmode", "CV.tex"]
+    # Added --enable-installer for MiKTeX and captured stderr
+    cmd = [PDFLATEX, "-interaction=nonstopmode", "--enable-installer", "CV.tex"]
+    
+    # Run once
     subprocess.run(cmd, cwd=out_dir, capture_output=True)
+    # Run twice (standard for LaTeX to resolve references)
     result = subprocess.run(cmd, cwd=out_dir, capture_output=True)
 
     pdf = out_dir / "CV.pdf"
     if pdf.exists():
         return pdf
 
-    log(f"[{job_id}] pdflatex failed:\n{result.stdout.decode()[-2000:]}")
+    # Log full output for debugging
+    log(f"[{job_id}] pdflatex failed. STDOUT:\n{result.stdout.decode()[-1000:]}")
+    log(f"[{job_id}] pdflatex failed. STDERR:\n{result.stderr.decode()[-1000:]}")
     return None
 
 
-def run_generation(job_id: str, offer: str, company: str, role: str, language: str) -> None:
+def run_generation(job_id: str, offer: str, language: str) -> None:
     try:
         write_status(job_id, "processing")
         mqtt_pub(f"{MQTT_PREFIX}/jobs/{job_id}/status", {"job_id": job_id, "state": "processing"})
@@ -254,28 +274,41 @@ def run_generation(job_id: str, offer: str, company: str, role: str, language: s
         log(f"[{job_id}] calling OpenAI...")
         context = load_context_text()
         result = call_openai({
-            "company": company,
-            "role_title": role,
             "language": language,
             "job_offer_text": offer[:6000],
             "context_documents": context,
         })
 
+        company = result.get("company", "Unknown Company")
+        role = result.get("role_title", "Unknown Role")
+
         semantic_path = job_dir(job_id) / "output" / "semantic.json"
         semantic_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
 
-        log(f"[{job_id}] compiling LaTeX...")
+        log(f"[{job_id}] compiling LaTeX for {company} - {role}...")
         cv_tex = build_cv_tex(result, company, role)
         pdf = compile_latex(job_id, cv_tex)
 
         if pdf:
+            pdf_url = file_url(job_id, "output", "CV.pdf")
             outputs = {
                 "tex": file_url(job_id, "output", "CV.tex"),
-                "pdf": file_url(job_id, "output", "CV.pdf"),
+                "pdf": pdf_url,
             }
-            write_status(job_id, "done", outputs=outputs)
-            mqtt_pub(f"{MQTT_PREFIX}/jobs/{job_id}/status", {"job_id": job_id, "state": "done"})
-            mqtt_pub(f"{MQTT_PREFIX}/jobs/{job_id}/result", {"job_id": job_id, "outputs": outputs})
+            letter_text = result.get("letter", "")
+            
+            # Shortcut-friendly list: [job_title, company, pdf_url, letter_text]
+            shortcut_list = [role, company, pdf_url, letter_text]
+
+            write_status(job_id, "done", 
+                         outputs=outputs, 
+                         letter=letter_text, 
+                         company=company, 
+                         role_title=role,
+                         shortcut_list=shortcut_list)
+            
+            mqtt_pub(f"{MQTT_PREFIX}/jobs/{job_id}/status", {"job_id": job_id, "state": "done", "letter": letter_text})
+            mqtt_pub(f"{MQTT_PREFIX}/jobs/{job_id}/result", {"job_id": job_id, "outputs": outputs, "letter": letter_text})
             log(f"[{job_id}] done → {outputs['pdf']}")
         else:
             write_status(job_id, "failed", error="pdflatex compilation failed")
@@ -295,15 +328,30 @@ def run_generation(job_id: str, offer: str, company: str, role: str, language: s
 def jobs_create():
     jid = create_job()
     mqtt_pub(f"{MQTT_PREFIX}/jobs/new", {"job_id": jid})
+    base_url = get_base_url()
     return jsonify({
         "job_id": jid,
-        "status_url": f"{SERVER_BASE_URL}/jobs/{jid}",
-        "files_url": f"{SERVER_BASE_URL}/jobs/{jid}/files",
+        "status_url": f"{base_url}/jobs/{jid}",
+        "files_url": f"{base_url}/jobs/{jid}/files",
     }), 201
 
 
 @app.route("/jobs/<job_id>", methods=["GET"])
 def jobs_status(job_id):
+    wait = request.args.get("wait") == "1"
+    timeout = 60
+    start_time = time.time()
+    
+    while wait:
+        status = read_status(job_id)
+        if status.get("state") in ("done", "failed"):
+            return jsonify(status)
+        
+        if (time.time() - start_time) > timeout:
+            return jsonify(status)
+            
+        time.sleep(2)
+        
     return jsonify(read_status(job_id))
 
 
@@ -375,9 +423,8 @@ def generate_job():
     if not offer:
         return jsonify({"error": "job_offer_text is required"}), 400
 
-    company  = data.get("company", "")
-    role     = data.get("role_title", "")
     language = data.get("language", "fr")
+    sync = request.args.get("sync") == "1"
 
     jid = create_job()
     (job_dir(jid) / "input" / "job_offer.txt").write_text(offer, encoding="utf-8")
@@ -388,18 +435,29 @@ def generate_job():
         "input_url": file_url(jid, "input", "job_offer.txt"),
     })
 
+    if sync:
+        # Run in-thread for synchronous response
+        run_generation(jid, offer, language)
+        status = read_status(jid)
+        if status.get("state") == "done":
+            return jsonify(status.get("shortcut_list", []))
+        return jsonify({"error": status.get("error", "Generation failed")}), 500
+
     threading.Thread(
         target=run_generation,
-        args=(jid, offer, company, role, language),
+        args=(jid, offer, language),
         daemon=True,
     ).start()
 
+    base_url = get_base_url()
     return jsonify({
         "job_id": jid,
         "state": "processing",
-        "status_url": f"{SERVER_BASE_URL}/jobs/{jid}",
-        "poll_url":   f"{SERVER_BASE_URL}/jobs/{jid}",
-        "pdf_url":    f"{SERVER_BASE_URL}/jobs/{jid}/files/output/CV.pdf",
+        "status_url": f"{base_url}/jobs/{jid}",
+        "poll_url":   f"{base_url}/jobs/{jid}",
+        "pdf_url":    f"{base_url}/jobs/{jid}/files/output/CV.pdf",
+        "tex_url":    f"{base_url}/jobs/{jid}/files/output/CV.tex",
+        "shortcut_friendly": f"{base_url}/jobs/{jid}?wait=1"
     }), 202
 
 
