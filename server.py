@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import threading
 import time
+import sys
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -37,15 +38,17 @@ LOG_FILE     = BASE_DIR / "server_debug.log"
 CONTEXT_DIR.mkdir(exist_ok=True)
 WORKDIR.mkdir(exist_ok=True)
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+# Extract the key, strip surrounding whitespace, and filter out non-ASCII characters
+_raw_key = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_API_KEY = "".join(c for c in _raw_key if ord(c) < 128)
+OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 PDFLATEX       = os.environ.get("PDFLATEX_PATH", "pdflatex")
 SERVER_BASE_URL = os.environ.get("SERVER_BASE_URL", "")
 
 MQTT_HOST   = os.environ.get("MQTT_HOST", "localhost")
 MQTT_PORT   = int(os.environ.get("MQTT_PORT", 1883))
-MQTT_USER   = os.environ.get("MQTT_USER", "abysse8")
-MQTT_PASS   = os.environ.get("MQTT_PASS", "")
+MQTT_USER   = "".join(c for c in os.environ.get("MQTT_USER", "abysse8").strip() if ord(c) < 128)
+MQTT_PASS   = "".join(c for c in os.environ.get("MQTT_PASS", "").strip() if ord(c) < 128)
 MQTT_PREFIX = "abysse8/coverai"
 
 ASSET_FILENAMES = ["photo.jpg", "logo_cefipa.png", "logo_cesi.png"]
@@ -83,10 +86,18 @@ mqtt_client = None
 # ---------------------------------------------------------------------------
 
 def log(message: str) -> None:
-    line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
-    print(line, flush=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    try:
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+        print(line, flush=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        # Fallback for encoding errors during logging
+        try:
+            line = f"[{datetime.now().strftime('%H:%M:%S')}] {message.encode('ascii', errors='replace').decode('ascii')}"
+            print(line, flush=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -223,9 +234,9 @@ def load_context_text(max_chars: int = 9000) -> list:
 def call_openai(payload: dict) -> dict:
     if openai_client is None:
         raise RuntimeError("OPENAI_API_KEY not set")
-    response = openai_client.responses.create(
+    response = openai_client.chat.completions.create(
         model=OPENAI_MODEL,
-        input=[
+        messages=[
             {"role": "system", "content": (
                 "Tu es CoverAI, un assistant de candidature pour stages en systèmes embarqués et IA appliquée.\n"
                 "Produis uniquement des données sémantiques minimales en JSON. Jamais de commandes LaTeX.\n"
@@ -236,10 +247,9 @@ def call_openai(payload: dict) -> dict:
             )},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
-        text={"format": {"type": "json_schema", "name": "coverai_output", "schema": OUTPUT_SCHEMA, "strict": True}},
-        store=False,
+        response_format={"type": "json_schema", "json_schema": {"name": "coverai_output", "schema": OUTPUT_SCHEMA, "strict": True}},
     )
-    return json.loads(response.output_text)
+    return json.loads(response.choices[0].message.content)
 
 
 def compile_latex(job_id: str, cv_tex: str) -> Path | None:
@@ -273,11 +283,15 @@ def run_generation(job_id: str, offer: str, language: str) -> None:
 
         log(f"[{job_id}] calling OpenAI...")
         context = load_context_text()
-        result = call_openai({
+        
+        # Ensure payload is UTF-8 encoded. The OpenAI client handles UTF-8 by default.
+        payload = {
             "language": language,
             "job_offer_text": offer[:6000],
             "context_documents": context,
-        })
+        }
+        
+        result = call_openai(payload)
 
         company = result.get("company", "Unknown Company")
         role = result.get("role_title", "Unknown Role")
@@ -315,7 +329,9 @@ def run_generation(job_id: str, offer: str, language: str) -> None:
             mqtt_pub(f"{MQTT_PREFIX}/jobs/{job_id}/error", {"job_id": job_id, "error": "pdflatex failed"})
 
     except Exception as e:
-        log(f"[{job_id}] error: {e}")
+        log(f"[{job_id}] error: {type(e).__name__}: {e}")
+        import traceback
+        log(traceback.format_exc())
         write_status(job_id, "failed", error=str(e))
         mqtt_pub(f"{MQTT_PREFIX}/jobs/{job_id}/error", {"job_id": job_id, "error": str(e)})
 
@@ -503,5 +519,10 @@ def logs():
 
 
 if __name__ == "__main__":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     init_mqtt()
     app.run(host="0.0.0.0", port=9090, debug=False, threaded=True)

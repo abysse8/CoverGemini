@@ -6,7 +6,6 @@ __pycache__/
 *.log
 .idea/
 venv/
-.env
 *.db
 *.pdf
 *.jpg
