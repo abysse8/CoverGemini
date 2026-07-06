@@ -11,7 +11,19 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterator
 
+from sqlalchemy import create_engine
+from sqlalchemy import event as sqla_event
+from sqlalchemy.orm import Session
+
+from .models import Event
+
 DEFAULT_USER_ID = "julien"
+
+
+def _enable_foreign_keys(dbapi_connection, _connection_record) -> None:
+    # SQLite ships with foreign keys OFF per connection; the raw sqlite3 path
+    # turns them on in connect(), so the SQLAlchemy path must match.
+    dbapi_connection.execute("PRAGMA foreign_keys = ON")
 
 DEFAULT_PLATFORMS = [
     {
@@ -106,6 +118,10 @@ class CoverAiStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.init_db()
+        # SQLAlchemy engine alongside the raw sqlite3 path while methods are
+        # converted one table at a time; both read the same file.
+        self.engine = create_engine(f"sqlite:///{self.path}")
+        sqla_event.listen(self.engine, "connect", _enable_foreign_keys)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -1089,13 +1105,16 @@ class CoverAiStore:
     def add_event(self, event_type: str, subject_type: str = "", subject_id: str = "", payload: dict[str, Any] | None = None, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
         now = utc_now()
         payload_json = json.dumps(payload or {}, ensure_ascii=False)
-        with self.connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO events (user_id, event_type, subject_type, subject_id, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (user_id, event_type, subject_type, subject_id, payload_json, now),
-            )
-            event_id = cur.lastrowid
+        event = Event(
+            user_id=user_id,
+            event_type=event_type,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            payload_json=payload_json,
+            created_at=now,
+        )
+        with Session(self.engine) as session:
+            session.add(event)
+            session.commit()
+            event_id = event.id
         return {"id": event_id, "user_id": user_id, "event_type": event_type, "subject_type": subject_type, "subject_id": subject_id, "payload": payload or {}, "created_at": now}
