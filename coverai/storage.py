@@ -382,21 +382,14 @@ class CoverAiStore:
         return f"{prefix}{secrets.token_hex(8)}"
 
     def any_id_exists(self, value: str) -> bool:
-        with self.connect() as conn:
-            for table in ("users", "offers", "explorer_runs", "queue_items", "sms_reports", "sms_messages", "application_tasks", "application_questions"):
-                row = conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (value,)).fetchone()
-                if row:
-                    return True
-        return False
-
-    @staticmethod
-    def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
-        return None if row is None else dict(row)
+        models = (User, Offer, ExplorerRun, QueueItem, SmsReport, SmsMessage, ApplicationTask, ApplicationQuestion)
+        with Session(self.engine) as session:
+            return any(session.get(model, value) is not None for model in models)
 
     @staticmethod
     def model_to_dict(obj: Any) -> dict[str, Any]:
-        # ORM counterpart of row_to_dict: converted methods keep returning
-        # plain dicts so callers never see model objects.
+        # Converted methods keep returning plain dicts so callers never see
+        # model objects.
         return {column.name: getattr(obj, column.name) for column in obj.__table__.columns}
 
     def get_user(self, user_id: str = DEFAULT_USER_ID) -> dict[str, Any] | None:
@@ -795,46 +788,38 @@ class CoverAiStore:
             raise KeyError(f"Unknown offer: {offer_id}")
         now = utc_now()
         created = False
-        with self.connect() as conn:
-            existing = conn.execute(
-                "SELECT * FROM application_tasks WHERE user_id = ? AND offer_id = ?",
-                (user_id, offer_id),
-            ).fetchone()
-            if existing:
-                app_id = str(existing["id"])
-                conn.execute(
-                    """
-                    UPDATE application_tasks
-                    SET company = ?, role_title = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (str(offer.get("company") or ""), str(offer.get("title") or ""), now, app_id),
+        with Session(self.engine) as session:
+            existing = session.scalars(
+                select(ApplicationTask).where(
+                    ApplicationTask.user_id == user_id, ApplicationTask.offer_id == offer_id
                 )
+            ).first()
+            if existing:
+                app_id = str(existing.id)
+                existing.company = str(offer.get("company") or "")
+                existing.role_title = str(offer.get("title") or "")
+                existing.updated_at = now
             else:
                 queue = self.create_queue_item("application.prepare", "offer", offer_id, {"offer_id": offer_id}, user_id=user_id)
                 app_id = self.new_id("app_")
-                conn.execute(
-                    """
-                    INSERT INTO application_tasks (
-                        id, user_id, offer_id, queue_item_id, company, role_title, status,
-                        artifacts_json, strategy_text, last_action, created_at, updated_at
+                session.add(
+                    ApplicationTask(
+                        id=app_id,
+                        user_id=user_id,
+                        offer_id=offer_id,
+                        queue_item_id=queue["id"],
+                        company=str(offer.get("company") or ""),
+                        role_title=str(offer.get("title") or ""),
+                        status="preparing",
+                        artifacts_json="{}",
+                        strategy_text=self.default_application_strategy(offer),
+                        last_action="Application task created",
+                        created_at=now,
+                        updated_at=now,
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, 'preparing', '{}', ?, ?, ?, ?)
-                    """,
-                    (
-                        app_id,
-                        user_id,
-                        offer_id,
-                        queue["id"],
-                        str(offer.get("company") or ""),
-                        str(offer.get("title") or ""),
-                        self.default_application_strategy(offer),
-                        "Application task created",
-                        now,
-                        now,
-                    ),
                 )
                 created = True
+            session.commit()
         if created:
             self.seed_application_questions(app_id, offer, user_id=user_id)
         app = self.recalculate_application_readiness(app_id, user_id=user_id)
@@ -884,71 +869,69 @@ class CoverAiStore:
     ) -> dict[str, Any]:
         question_id = self.new_id("aq_")
         now = utc_now()
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO application_questions (
-                    id, user_id, application_id, label, field_type, required, answer,
-                    answer_source, confidence, status, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    question_id,
-                    user_id,
-                    application_id,
-                    label,
-                    field_type,
-                    1 if required else 0,
-                    answer,
-                    answer_source,
-                    max(0, min(int(confidence), 100)),
-                    status,
-                    now,
-                    now,
-                ),
-            )
+        question = ApplicationQuestion(
+            id=question_id,
+            user_id=user_id,
+            application_id=application_id,
+            label=label,
+            field_type=field_type,
+            required=1 if required else 0,
+            answer=answer,
+            answer_source=answer_source,
+            confidence=max(0, min(int(confidence), 100)),
+            status=status,
+            created_at=now,
+            updated_at=now,
+        )
+        with Session(self.engine) as session:
+            session.add(question)
+            session.commit()
         return self.get_application_question(question_id) or {"id": question_id}
 
     def get_application_task(self, application_id: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            return self.row_to_dict(
-                conn.execute("SELECT * FROM application_tasks WHERE id = ? AND user_id = ?", (application_id, user_id)).fetchone()
-            )
+        stmt = select(ApplicationTask).where(
+            ApplicationTask.id == application_id, ApplicationTask.user_id == user_id
+        )
+        with Session(self.engine) as session:
+            task = session.scalars(stmt).first()
+            return self.model_to_dict(task) if task else None
 
     def get_application_for_offer(self, offer_id: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            return self.row_to_dict(
-                conn.execute("SELECT * FROM application_tasks WHERE offer_id = ? AND user_id = ?", (offer_id, user_id)).fetchone()
-            )
+        stmt = select(ApplicationTask).where(
+            ApplicationTask.offer_id == offer_id, ApplicationTask.user_id == user_id
+        )
+        with Session(self.engine) as session:
+            task = session.scalars(stmt).first()
+            return self.model_to_dict(task) if task else None
 
     def list_application_tasks(self, status: str = "", limit: int = 20, user_id: str = DEFAULT_USER_ID) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
-        where = ["user_id = ?"]
-        args: list[Any] = [user_id]
+        stmt = select(ApplicationTask).where(ApplicationTask.user_id == user_id)
         if status:
-            where.append("status = ?")
-            args.append(status)
-        query = "SELECT * FROM application_tasks WHERE " + " AND ".join(where) + " ORDER BY updated_at DESC LIMIT ?"
-        args.append(limit)
-        with self.connect() as conn:
-            return [dict(row) for row in conn.execute(query, args).fetchall()]
+            stmt = stmt.where(ApplicationTask.status == status)
+        stmt = stmt.order_by(ApplicationTask.updated_at.desc()).limit(limit)
+        with Session(self.engine) as session:
+            return [self.model_to_dict(task) for task in session.scalars(stmt)]
 
     def get_application_question(self, question_id: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            return self.row_to_dict(
-                conn.execute("SELECT * FROM application_questions WHERE id = ? AND user_id = ?", (question_id, user_id)).fetchone()
-            )
+        stmt = select(ApplicationQuestion).where(
+            ApplicationQuestion.id == question_id, ApplicationQuestion.user_id == user_id
+        )
+        with Session(self.engine) as session:
+            question = session.scalars(stmt).first()
+            return self.model_to_dict(question) if question else None
 
     def list_application_questions(self, application_id: str, user_id: str = DEFAULT_USER_ID) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            return [
-                dict(row)
-                for row in conn.execute(
-                    "SELECT * FROM application_questions WHERE application_id = ? AND user_id = ? ORDER BY created_at",
-                    (application_id, user_id),
-                ).fetchall()
-            ]
+        stmt = (
+            select(ApplicationQuestion)
+            .where(
+                ApplicationQuestion.application_id == application_id,
+                ApplicationQuestion.user_id == user_id,
+            )
+            .order_by(ApplicationQuestion.created_at)
+        )
+        with Session(self.engine) as session:
+            return [self.model_to_dict(question) for question in session.scalars(stmt)]
 
     @staticmethod
     def application_field_key(label: str) -> str:
@@ -1042,17 +1025,19 @@ class CoverAiStore:
         if "confidence" in updates:
             updates["confidence"] = max(0, min(int(updates["confidence"]), 100))
         updates["updated_at"] = utc_now()
-        assignments = ", ".join(f"{key} = ?" for key in updates)
-        values = list(updates.values()) + [question_id, user_id]
-        with self.connect() as conn:
-            cursor = conn.execute(
-                f"UPDATE application_questions SET {assignments} WHERE id = ? AND user_id = ?",
-                values,
-            )
-            if cursor.rowcount == 0:
+        with Session(self.engine) as session:
+            row = session.scalars(
+                select(ApplicationQuestion).where(
+                    ApplicationQuestion.id == question_id,
+                    ApplicationQuestion.user_id == user_id,
+                )
+            ).first()
+            if not row:
                 raise KeyError(f"Unknown application question: {question_id}")
-            row = conn.execute("SELECT application_id FROM application_questions WHERE id = ?", (question_id,)).fetchone()
-            application_id = str(row["application_id"]) if row else ""
+            for key, value in updates.items():
+                setattr(row, key, value)
+            application_id = str(row.application_id)
+            session.commit()
         if application_id:
             self.recalculate_application_readiness(application_id, user_id=user_id)
         question = self.get_application_question(question_id, user_id=user_id)
@@ -1061,19 +1046,23 @@ class CoverAiStore:
         return question
 
     def answer_next_application_question(self, application_id: str, answer: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM application_questions
-                WHERE application_id = ? AND user_id = ? AND status = 'needs_user'
-                ORDER BY created_at LIMIT 1
-                """,
-                (application_id, user_id),
-            ).fetchone()
-        if not row:
+        stmt = (
+            select(ApplicationQuestion)
+            .where(
+                ApplicationQuestion.application_id == application_id,
+                ApplicationQuestion.user_id == user_id,
+                ApplicationQuestion.status == "needs_user",
+            )
+            .order_by(ApplicationQuestion.created_at)
+            .limit(1)
+        )
+        with Session(self.engine) as session:
+            row = session.scalars(stmt).first()
+            question_id = str(row.id) if row else ""
+        if not question_id:
             return None
         return self.update_application_question(
-            str(row["id"]),
+            question_id,
             user_id=user_id,
             answer=answer,
             answer_source="user_sms",
@@ -1098,18 +1087,22 @@ class CoverAiStore:
         percent = int(round((answered / total) * 100)) if total else 0
         status = "ready_to_fill" if total and answered == total else ("needs_user" if needs_user else "preparing")
         now = utc_now()
-        with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE application_tasks
-                SET status = ?, readiness_percent = ?, questions_total = ?, questions_answered = ?,
-                    questions_needs_user = ?, questions_low_confidence = ?, updated_at = ?
-                WHERE id = ? AND user_id = ?
-                """,
-                (status, percent, total, answered, len(needs_user), len(low_confidence), now, application_id, user_id),
-            )
-            if cursor.rowcount == 0:
+        with Session(self.engine) as session:
+            task = session.scalars(
+                select(ApplicationTask).where(
+                    ApplicationTask.id == application_id, ApplicationTask.user_id == user_id
+                )
+            ).first()
+            if not task:
                 raise KeyError(f"Unknown application task: {application_id}")
+            task.status = status
+            task.readiness_percent = percent
+            task.questions_total = total
+            task.questions_answered = answered
+            task.questions_needs_user = len(needs_user)
+            task.questions_low_confidence = len(low_confidence)
+            task.updated_at = now
+            session.commit()
         app = self.get_application_task(application_id, user_id=user_id)
         if not app:
             raise KeyError(f"Unknown application task: {application_id}")
