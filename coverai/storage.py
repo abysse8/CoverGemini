@@ -15,7 +15,17 @@ from sqlalchemy import create_engine, select, update
 from sqlalchemy import event as sqla_event
 from sqlalchemy.orm import Session
 
-from .models import Event, ExplorerRun, SmsMessage
+from .models import (
+    Event,
+    ExplorerRun,
+    Offer,
+    Platform,
+    QueueItem,
+    SmsMessage,
+    SmsReport,
+    User,
+    UserPlatformAccount,
+)
 
 DEFAULT_USER_ID = "julien"
 
@@ -117,11 +127,12 @@ class CoverAiStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.init_db()
         # SQLAlchemy engine alongside the raw sqlite3 path while methods are
-        # converted one table at a time; both read the same file.
+        # converted one table at a time; both read the same file. Built before
+        # init_db because seeding runs through the engine.
         self.engine = create_engine(f"sqlite:///{self.path}")
         sqla_event.listen(self.engine, "connect", _enable_foreign_keys)
+        self.init_db()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -335,43 +346,31 @@ class CoverAiStore:
 
     def seed_defaults(self) -> None:
         now = utc_now()
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO users (id, email, display_name, role, phone, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    display_name = excluded.display_name,
-                    role = excluded.role,
-                    phone = excluded.phone,
-                    updated_at = excluded.updated_at
-                """,
-                (DEFAULT_USER_ID, "", "Julien", "admin", "+33775857082", now, now),
-            )
-            for platform in DEFAULT_PLATFORMS:
-                conn.execute(
-                    """
-                    INSERT INTO platforms (id, name, base_url, login_url, kind, enabled, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        name = excluded.name,
-                        base_url = excluded.base_url,
-                        login_url = excluded.login_url,
-                        kind = excluded.kind,
-                        enabled = 1,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        platform["id"],
-                        platform["name"],
-                        platform["base_url"],
-                        platform["login_url"],
-                        platform["kind"],
-                        now,
-                        now,
-                    ),
-                )
-                self._ensure_user_platform_account(conn, DEFAULT_USER_ID, platform["id"], now)
+        with Session(self.engine) as session:
+            user = session.get(User, DEFAULT_USER_ID)
+            if user is None:
+                user = User(id=DEFAULT_USER_ID, created_at=now)
+                session.add(user)
+            user.display_name = "Julien"
+            user.role = "admin"
+            user.phone = "+33775857082"
+            user.updated_at = now
+            for seed in DEFAULT_PLATFORMS:
+                platform = session.get(Platform, seed["id"])
+                if platform is None:
+                    platform = Platform(id=seed["id"], created_at=now)
+                    session.add(platform)
+                platform.name = seed["name"]
+                platform.base_url = seed["base_url"]
+                platform.login_url = seed["login_url"]
+                platform.kind = seed["kind"]
+                platform.enabled = 1
+                platform.updated_at = now
+                # Flush pending user/platform rows so the account's foreign
+                # keys resolve before _ensure looks them up.
+                session.flush()
+                self._ensure_user_platform_account(session, DEFAULT_USER_ID, seed["id"], now)
+            session.commit()
 
     def new_id(self, prefix: str = "") -> str:
         for _ in range(20):
@@ -399,82 +398,89 @@ class CoverAiStore:
         return {column.name: getattr(obj, column.name) for column in obj.__table__.columns}
 
     def get_user(self, user_id: str = DEFAULT_USER_ID) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            return self.row_to_dict(conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone())
+        with Session(self.engine) as session:
+            user = session.get(User, user_id)
+            return self.model_to_dict(user) if user else None
 
     def list_platforms(self) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            return [dict(row) for row in conn.execute("SELECT * FROM platforms WHERE enabled = 1 ORDER BY name").fetchall()]
+        stmt = select(Platform).where(Platform.enabled == 1).order_by(Platform.name)
+        with Session(self.engine) as session:
+            return [self.model_to_dict(platform) for platform in session.scalars(stmt)]
 
     def get_platform(self, platform_id: str) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            return self.row_to_dict(conn.execute("SELECT * FROM platforms WHERE id = ?", (platform_id,)).fetchone())
+        with Session(self.engine) as session:
+            platform = session.get(Platform, platform_id)
+            return self.model_to_dict(platform) if platform else None
+
+    def _account_with_platform(self, account: UserPlatformAccount, platform: Platform) -> dict[str, Any]:
+        # Same shape as the old "SELECT a.*, p.name, p.base_url, p.kind" join.
+        row = self.model_to_dict(account)
+        row.update({"name": platform.name, "base_url": platform.base_url, "kind": platform.kind})
+        return row
 
     def user_platform_accounts(self, user_id: str = DEFAULT_USER_ID) -> list[dict[str, Any]]:
         now = utc_now()
-        with self.connect() as conn:
-            for platform in DEFAULT_PLATFORMS:
-                self._ensure_user_platform_account(conn, user_id, platform["id"], now)
-            rows = conn.execute(
-                """
-                SELECT a.*, p.name, p.base_url, p.kind
-                FROM user_platform_accounts a
-                JOIN platforms p ON p.id = a.platform_id
-                WHERE a.user_id = ?
-                ORDER BY p.name
-                """,
-                (user_id,),
-            ).fetchall()
-            return [dict(row) for row in rows]
+        with Session(self.engine) as session:
+            for seed in DEFAULT_PLATFORMS:
+                self._ensure_user_platform_account(session, user_id, seed["id"], now)
+            session.commit()
+            stmt = (
+                select(UserPlatformAccount, Platform)
+                .join(Platform, UserPlatformAccount.platform_id == Platform.id)
+                .where(UserPlatformAccount.user_id == user_id)
+                .order_by(Platform.name)
+            )
+            return [
+                self._account_with_platform(account, platform)
+                for account, platform in session.execute(stmt)
+            ]
 
     def get_user_platform_account(self, user_id: str, platform_id: str) -> dict[str, Any]:
         now = utc_now()
-        with self.connect() as conn:
-            self._ensure_user_platform_account(conn, user_id, platform_id, now)
-            row = conn.execute(
-                """
-                SELECT a.*, p.name, p.base_url, p.kind
-                FROM user_platform_accounts a
-                JOIN platforms p ON p.id = a.platform_id
-                WHERE a.user_id = ? AND a.platform_id = ?
-                """,
-                (user_id, platform_id),
-            ).fetchone()
-        if not row:
-            raise KeyError(f"Unknown platform account: {user_id}/{platform_id}")
-        return dict(row)
+        with Session(self.engine) as session:
+            self._ensure_user_platform_account(session, user_id, platform_id, now)
+            session.commit()
+            account = session.get(UserPlatformAccount, (user_id, platform_id))
+            platform = session.get(Platform, platform_id)
+            if not account or not platform:
+                raise KeyError(f"Unknown platform account: {user_id}/{platform_id}")
+            return self._account_with_platform(account, platform)
 
     def update_user_platform_account(self, user_id: str, platform_id: str, **fields: Any) -> dict[str, Any]:
         allowed = {"login_url", "profile_dir", "status", "last_login_check_at", "metadata_json"}
         updates = {key: value for key, value in fields.items() if key in allowed}
         updates["updated_at"] = utc_now()
-        assignments = ", ".join(f"{key} = ?" for key in updates)
-        values = list(updates.values()) + [user_id, platform_id]
-        with self.connect() as conn:
-            self._ensure_user_platform_account(conn, user_id, platform_id, utc_now())
-            conn.execute(
-                f"UPDATE user_platform_accounts SET {assignments} WHERE user_id = ? AND platform_id = ?",
-                values,
-            )
+        with Session(self.engine) as session:
+            self._ensure_user_platform_account(session, user_id, platform_id, utc_now())
+            account = session.get(UserPlatformAccount, (user_id, platform_id))
+            for key, value in updates.items():
+                setattr(account, key, value)
+            session.commit()
         return self.get_user_platform_account(user_id, platform_id)
 
-    def _ensure_user_platform_account(self, conn: sqlite3.Connection, user_id: str, platform_id: str, now: str) -> None:
-        platform = conn.execute("SELECT login_url FROM platforms WHERE id = ?", (platform_id,)).fetchone()
-        user = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+    def _ensure_user_platform_account(self, session: Session, user_id: str, platform_id: str, now: str) -> None:
+        platform = session.get(Platform, platform_id)
         if not platform:
             raise KeyError(f"Unknown platform: {platform_id}")
-        if not user:
+        if not session.get(User, user_id):
             raise KeyError(f"Unknown user: {user_id}")
+        # Composite primary key: session.get takes the key columns as a tuple
+        # in declaration order. Existing row means nothing to do (the old
+        # ON CONFLICT DO NOTHING).
+        if session.get(UserPlatformAccount, (user_id, platform_id)):
+            return
         profile_dir = str(Path(".coverai-browser") / "users" / user_id / platform_id)
-        conn.execute(
-            """
-            INSERT INTO user_platform_accounts (
-                user_id, platform_id, login_url, profile_dir, status, metadata_json, created_at, updated_at
+        session.add(
+            UserPlatformAccount(
+                user_id=user_id,
+                platform_id=platform_id,
+                login_url=str(platform.login_url or ""),
+                profile_dir=profile_dir,
+                status="not_connected",
+                metadata_json="{}",
+                created_at=now,
+                updated_at=now,
             )
-            VALUES (?, ?, ?, ?, 'not_connected', '{}', ?, ?)
-            ON CONFLICT(user_id, platform_id) DO NOTHING
-            """,
-            (user_id, platform_id, str(platform["login_url"] or ""), profile_dir, now, now),
         )
 
     def create_explorer_run(self, config_path: str = "", user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
@@ -686,14 +692,20 @@ class CoverAiStore:
     def create_queue_item(self, item_type: str, subject_type: str = "", subject_id: str = "", payload: dict[str, Any] | None = None, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
         item_id = self.new_id("q_")
         now = utc_now()
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO queue_items (id, user_id, type, status, subject_type, subject_id, payload_json, created_at, updated_at)
-                VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)
-                """,
-                (item_id, user_id, item_type, subject_type, subject_id, json.dumps(payload or {}, ensure_ascii=False), now, now),
-            )
+        item = QueueItem(
+            id=item_id,
+            user_id=user_id,
+            type=item_type,
+            status="queued",
+            subject_type=subject_type,
+            subject_id=subject_id,
+            payload_json=json.dumps(payload or {}, ensure_ascii=False),
+            created_at=now,
+            updated_at=now,
+        )
+        with Session(self.engine) as session:
+            session.add(item)
+            session.commit()
         return {"id": item_id, "user_id": user_id, "type": item_type, "status": "queued", "subject_type": subject_type, "subject_id": subject_id, "payload": payload or {}}
 
     def record_sms_report(self, offer_id: str, number: str, text: str, status: str, response: dict[str, Any] | None = None, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
@@ -703,31 +715,34 @@ class CoverAiStore:
         report_id = self.new_id("sms_")
         now = utc_now()
         response_json = json.dumps(response or {}, ensure_ascii=False)
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO sms_reports (id, user_id, offer_id, number, text, status, response_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (report_id, user_id, offer_id, number, text, status, response_json, now),
-            )
+        report = SmsReport(
+            id=report_id,
+            user_id=user_id,
+            offer_id=offer_id,
+            number=number,
+            text=text,
+            status=status,
+            response_json=response_json,
+            created_at=now,
+        )
+        with Session(self.engine) as session:
+            session.add(report)
+            session.commit()
         self.add_event("sms.report", "offer", offer_id, {"report_id": report_id, "status": status}, user_id=user_id)
         return {"id": report_id, "user_id": user_id, "offer_id": offer_id, "number": number, "text": text, "status": status, "response": response or {}, "created_at": now}
 
     def recent_reported_offers(self, phone: str = "", limit: int = 5, user_id: str = DEFAULT_USER_ID) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 50))
-        where = ["r.user_id = ?", "r.status = 'sent'"]
-        args: list[Any] = [user_id]
-        if phone:
-            where.append("r.number = ?")
-            args.append(phone)
-        query = (
-            "SELECT o.* FROM sms_reports r JOIN offers o ON o.id = r.offer_id "
-            "WHERE " + " AND ".join(where) + " ORDER BY r.created_at DESC LIMIT ?"
+        stmt = (
+            select(Offer)
+            .join(SmsReport, SmsReport.offer_id == Offer.id)
+            .where(SmsReport.user_id == user_id, SmsReport.status == "sent")
         )
-        args.append(limit)
-        with self.connect() as conn:
-            return [dict(row) for row in conn.execute(query, args).fetchall()]
+        if phone:
+            stmt = stmt.where(SmsReport.number == phone)
+        stmt = stmt.order_by(SmsReport.created_at.desc()).limit(limit)
+        with Session(self.engine) as session:
+            return [self.model_to_dict(offer) for offer in session.scalars(stmt)]
 
     def latest_reported_offer(self, phone: str = "", user_id: str = DEFAULT_USER_ID) -> dict[str, Any] | None:
         offers = self.recent_reported_offers(phone, limit=1, user_id=user_id)
