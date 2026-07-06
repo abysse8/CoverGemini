@@ -1,0 +1,48 @@
+{
+  "keywords": [
+    "alternance systemes embarques",
+    "apprentissage electronique embarquee",
+    "embedded software apprentice",
+    "firmware intern",
+    "iot apprentice"
+  ],
+  "locations": [
+    "Ile-de-France",
+    "Paris",
+    "Nanterre",
+    "Orsay"
+  ],
+  "companies": [
+    "Safran",
+    "Thales",
+    "Valeo",
+    "Astek",
+    "Siemens"
+  ],
+  "source_urls": [
+    {
+      "name": "linkedin-stage-systemes-embarques-paris",
+      "url": "https://fr.linkedin.com/jobs/stage-syst%C3%A8mes-embarqu%C3%A9s-emplois-paris"
+    },
+    {
+      "name": "apec-cpp-embarque",
+      "url": "https://www.apec.fr/candidat/recherche-emploi.html/emploi?motsCles=Alternance+-+D%C3%A9veloppement+C%2FC%2B%2B+embarqu%C3%A9"
+    },
+    {
+      "name": "hellowork-ingenieur-systemes-embarques-idf",
+      "url": "https://www.hellowork.com/fr-fr/emploi/metier_ingenieur-systemes-embarques-region_ile-de-france.html"
+    }
+  ],
+  "search_urls": [],
+  "career_pages": [],
+  "minimum_score": 65,
+  "max_candidates_per_source": 12,
+  "max_offers_per_run": 30,
+  "use_playwright": true,
+  "sms": {
+    "enabled": false,
+    "number": "",
+    "min_score": 70,
+    "max_reports_per_run": 3
+  }
+}

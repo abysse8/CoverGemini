@@ -1,13 +1,17 @@
 workdir/
 server_debug.log
+.env
+.coverai-browser/
 .DS_Store
 __pycache__/
 *.pyc
 *.log
 .idea/
 venv/
+.venv/
 *.db
 *.pdf
 *.jpg
 *.jpeg
 *.png
+.coverage
