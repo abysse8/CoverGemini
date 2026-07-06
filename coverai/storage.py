@@ -16,6 +16,8 @@ from sqlalchemy import event as sqla_event
 from sqlalchemy.orm import Session
 
 from .models import (
+    ApplicationQuestion,
+    ApplicationTask,
     Event,
     ExplorerRun,
     Offer,
@@ -542,84 +544,74 @@ class CoverAiStore:
             str(offer.get("snippet") or ""),
         )
         now = utc_now()
-        existing_id = ""
-        with self.connect() as conn:
-            existing = conn.execute("SELECT * FROM offers WHERE user_id = ? AND dedupe_hash = ?", (user_id, dedupe)).fetchone()
+        with Session(self.engine) as session:
+            existing = session.scalars(
+                select(Offer).where(Offer.user_id == user_id, Offer.dedupe_hash == dedupe)
+            ).first()
             if existing:
-                existing_id = str(existing["id"])
-                conn.execute(
-                    """
-                    UPDATE offers
-                    SET url = ?, title = ?, company = ?, location = ?, source = ?, raw_text = ?,
-                        snippet = ?, score = ?, summary = ?, updated_at = ?, last_seen_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        str(offer.get("url") or existing["url"] or ""),
-                        str(offer.get("title") or existing["title"] or ""),
-                        str(offer.get("company") or existing["company"] or ""),
-                        str(offer.get("location") or existing["location"] or ""),
-                        str(offer.get("source") or existing["source"] or ""),
-                        str(offer.get("raw_text") or existing["raw_text"] or ""),
-                        str(offer.get("snippet") or existing["snippet"] or ""),
-                        int(offer.get("score") or existing["score"] or 0),
-                        str(offer.get("summary") or existing["summary"] or ""),
-                        now,
-                        now,
-                        existing_id,
-                    ),
-                )
+                # Fresh scrape values win; blank fields keep the stored value.
+                existing.url = str(offer.get("url") or existing.url or "")
+                existing.title = str(offer.get("title") or existing.title or "")
+                existing.company = str(offer.get("company") or existing.company or "")
+                existing.location = str(offer.get("location") or existing.location or "")
+                existing.source = str(offer.get("source") or existing.source or "")
+                existing.raw_text = str(offer.get("raw_text") or existing.raw_text or "")
+                existing.snippet = str(offer.get("snippet") or existing.snippet or "")
+                existing.score = int(offer.get("score") or existing.score or 0)
+                existing.summary = str(offer.get("summary") or existing.summary or "")
+                existing.updated_at = now
+                existing.last_seen_at = now
+                existing_id = str(existing.id)
             else:
-                offer_id = str(offer.get("id") or self.new_id("off_"))
-                conn.execute(
-                    """
-                    INSERT INTO offers (
-                        id, user_id, dedupe_hash, url, title, company, location, source, raw_text,
-                        snippet, score, summary, status, cleanup_status, created_at, updated_at, last_seen_at
+                existing_id = str(offer.get("id") or self.new_id("off_"))
+                session.add(
+                    Offer(
+                        id=existing_id,
+                        user_id=user_id,
+                        dedupe_hash=dedupe,
+                        url=str(offer.get("url") or ""),
+                        title=str(offer.get("title") or ""),
+                        company=str(offer.get("company") or ""),
+                        location=str(offer.get("location") or ""),
+                        source=str(offer.get("source") or ""),
+                        raw_text=str(offer.get("raw_text") or ""),
+                        snippet=str(offer.get("snippet") or ""),
+                        score=int(offer.get("score") or 0),
+                        summary=str(offer.get("summary") or ""),
+                        status=str(offer.get("status") or "new"),
+                        cleanup_status=str(offer.get("cleanup_status") or "ok"),
+                        created_at=now,
+                        updated_at=now,
+                        last_seen_at=now,
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        offer_id,
-                        user_id,
-                        dedupe,
-                        str(offer.get("url") or ""),
-                        str(offer.get("title") or ""),
-                        str(offer.get("company") or ""),
-                        str(offer.get("location") or ""),
-                        str(offer.get("source") or ""),
-                        str(offer.get("raw_text") or ""),
-                        str(offer.get("snippet") or ""),
-                        int(offer.get("score") or 0),
-                        str(offer.get("summary") or ""),
-                        str(offer.get("status") or "new"),
-                        str(offer.get("cleanup_status") or "ok"),
-                        now,
-                        now,
-                        now,
-                    ),
                 )
-                existing_id = offer_id
+            created = existing is None
+            session.commit()
 
-        return self.get_offer(existing_id) or {"id": existing_id}, not bool(existing)
+        return self.get_offer(existing_id) or {"id": existing_id}, created
 
     def get_offer(self, offer_id: str) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            return self.row_to_dict(conn.execute("SELECT * FROM offers WHERE id = ?", (offer_id,)).fetchone())
+        with Session(self.engine) as session:
+            offer = session.get(Offer, offer_id)
+            return self.model_to_dict(offer) if offer else None
 
     def find_offer_by_reference(self, reference: str, user_id: str = DEFAULT_USER_ID, phone: str = "") -> dict[str, Any] | None:
         ref = " ".join(str(reference or "").lower().split())
         if not ref:
             return self.latest_reported_offer(phone, user_id=user_id) or (self.list_offers(limit=1, user_id=user_id) or [None])[0]
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM offers WHERE id = ? AND user_id = ?", (reference.strip(), user_id)).fetchone()
+        with Session(self.engine) as session:
+            row = session.scalars(
+                select(Offer).where(Offer.id == reference.strip(), Offer.user_id == user_id)
+            ).first()
             if row:
-                return dict(row)
+                return self.model_to_dict(row)
             for token in str(reference or "").replace(":", " ").replace(",", " ").split():
                 if token.startswith("off_"):
-                    row = conn.execute("SELECT * FROM offers WHERE id = ? AND user_id = ?", (token.strip(), user_id)).fetchone()
+                    row = session.scalars(
+                        select(Offer).where(Offer.id == token.strip(), Offer.user_id == user_id)
+                    ).first()
                     if row:
-                        return dict(row)
+                        return self.model_to_dict(row)
 
         if ref in {"this", "this one", "that", "that one", "it", "last", "latest", "the one", "the last one"} or any(
             phrase in ref for phrase in ("this one", "that one", "last one", "latest one", "the one")
@@ -661,28 +653,26 @@ class CoverAiStore:
 
     def list_offers(self, status: str = "", limit: int = 50, min_score: int | None = None, user_id: str = DEFAULT_USER_ID) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 200))
-        where: list[str] = ["user_id = ?"]
-        args: list[Any] = [user_id]
+        stmt = select(Offer).where(Offer.user_id == user_id)
         if status:
-            where.append("status = ?")
-            args.append(status)
+            stmt = stmt.where(Offer.status == status)
         if min_score is not None:
-            where.append("score >= ?")
-            args.append(int(min_score))
-        query = "SELECT * FROM offers"
-        if where:
-            query += " WHERE " + " AND ".join(where)
-        query += " ORDER BY score DESC, updated_at DESC LIMIT ?"
-        args.append(limit)
-        with self.connect() as conn:
-            return [dict(row) for row in conn.execute(query, args).fetchall()]
+            stmt = stmt.where(Offer.score >= int(min_score))
+        stmt = stmt.order_by(Offer.score.desc(), Offer.updated_at.desc()).limit(limit)
+        with Session(self.engine) as session:
+            return [self.model_to_dict(offer) for offer in session.scalars(stmt)]
 
     def mark_offer_status(self, offer_id: str, status: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
         now = utc_now()
-        with self.connect() as conn:
-            cursor = conn.execute("UPDATE offers SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?", (status, now, offer_id, user_id))
-            if cursor.rowcount == 0:
+        with Session(self.engine) as session:
+            row = session.scalars(
+                select(Offer).where(Offer.id == offer_id, Offer.user_id == user_id)
+            ).first()
+            if not row:
                 raise KeyError(f"Unknown offer: {offer_id}")
+            row.status = status
+            row.updated_at = now
+            session.commit()
         offer = self.get_offer(offer_id)
         if not offer:
             raise KeyError(f"Unknown offer: {offer_id}")
