@@ -11,11 +11,11 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select, update
 from sqlalchemy import event as sqla_event
 from sqlalchemy.orm import Session
 
-from .models import Event
+from .models import Event, ExplorerRun, SmsMessage
 
 DEFAULT_USER_ID = "julien"
 
@@ -392,6 +392,12 @@ class CoverAiStore:
     def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return None if row is None else dict(row)
 
+    @staticmethod
+    def model_to_dict(obj: Any) -> dict[str, Any]:
+        # ORM counterpart of row_to_dict: converted methods keep returning
+        # plain dicts so callers never see model objects.
+        return {column.name: getattr(obj, column.name) for column in obj.__table__.columns}
+
     def get_user(self, user_id: str = DEFAULT_USER_ID) -> dict[str, Any] | None:
         with self.connect() as conn:
             return self.row_to_dict(conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone())
@@ -474,14 +480,10 @@ class CoverAiStore:
     def create_explorer_run(self, config_path: str = "", user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
         run_id = self.new_id("run_")
         now = utc_now()
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO explorer_runs (id, user_id, status, config_path, started_at)
-                VALUES (?, ?, 'running', ?, ?)
-                """,
-                (run_id, user_id, config_path, now),
-            )
+        run = ExplorerRun(id=run_id, user_id=user_id, status="running", config_path=config_path, started_at=now)
+        with Session(self.engine) as session:
+            session.add(run)
+            session.commit()
         return self.get_explorer_run(run_id) or {"id": run_id, "status": "running"}
 
     def update_explorer_run(self, run_id: str, **fields: Any) -> dict[str, Any]:
@@ -489,37 +491,41 @@ class CoverAiStore:
         updates = {key: value for key, value in fields.items() if key in allowed}
         if not updates:
             return self.get_explorer_run(run_id) or {}
-        assignments = ", ".join(f"{key} = ?" for key in updates)
-        values = list(updates.values()) + [run_id]
-        with self.connect() as conn:
-            conn.execute(f"UPDATE explorer_runs SET {assignments} WHERE id = ?", values)
+        with Session(self.engine) as session:
+            run = session.get(ExplorerRun, run_id)
+            if run:
+                for key, value in updates.items():
+                    setattr(run, key, value)
+                session.commit()
         return self.get_explorer_run(run_id) or {}
 
     def get_explorer_run(self, run_id: str) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            return self.row_to_dict(conn.execute("SELECT * FROM explorer_runs WHERE id = ?", (run_id,)).fetchone())
+        with Session(self.engine) as session:
+            run = session.get(ExplorerRun, run_id)
+            return self.model_to_dict(run) if run else None
 
     def latest_explorer_run(self, user_id: str = DEFAULT_USER_ID) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            return self.row_to_dict(
-                conn.execute(
-                    "SELECT * FROM explorer_runs WHERE user_id = ? ORDER BY started_at DESC LIMIT 1",
-                    (user_id,),
-                ).fetchone()
-            )
+        stmt = (
+            select(ExplorerRun)
+            .where(ExplorerRun.user_id == user_id)
+            .order_by(ExplorerRun.started_at.desc())
+            .limit(1)
+        )
+        with Session(self.engine) as session:
+            run = session.scalars(stmt).first()
+            return self.model_to_dict(run) if run else None
 
     def mark_stale_explorer_runs(self, reason: str = "server restarted before run completed", user_id: str = DEFAULT_USER_ID) -> int:
         now = utc_now()
-        with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE explorer_runs
-                SET status = 'failed', completed_at = ?, error = ?
-                WHERE user_id = ? AND status = 'running'
-                """,
-                (now, reason, user_id),
-            )
-            return int(cursor.rowcount or 0)
+        stmt = (
+            update(ExplorerRun)
+            .where(ExplorerRun.user_id == user_id, ExplorerRun.status == "running")
+            .values(status="failed", completed_at=now, error=reason)
+        )
+        with Session(self.engine) as session:
+            result = session.execute(stmt)
+            session.commit()
+            return int(result.rowcount or 0)
 
     def upsert_offer(self, offer: dict[str, Any], user_id: str = DEFAULT_USER_ID) -> tuple[dict[str, Any], bool]:
         dedupe = offer.get("dedupe_hash") or offer_dedupe_hash(
@@ -738,14 +744,19 @@ class CoverAiStore:
     ) -> dict[str, Any]:
         message_id = self.new_id("msg_")
         now = utc_now()
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO sms_messages (id, user_id, direction, phone, text, response_text, command, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (message_id, user_id, direction, phone, text, response_text, command, now),
-            )
+        message = SmsMessage(
+            id=message_id,
+            user_id=user_id,
+            direction=direction,
+            phone=phone,
+            text=text,
+            response_text=response_text,
+            command=command,
+            created_at=now,
+        )
+        with Session(self.engine) as session:
+            session.add(message)
+            session.commit()
         self.add_event(
             "sms.message",
             "sms",
@@ -766,15 +777,12 @@ class CoverAiStore:
 
     def recent_sms_messages(self, user_id: str = DEFAULT_USER_ID, phone: str = "", limit: int = 8) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 50))
-        where = ["user_id = ?"]
-        args: list[Any] = [user_id]
+        stmt = select(SmsMessage).where(SmsMessage.user_id == user_id)
         if phone:
-            where.append("phone = ?")
-            args.append(phone)
-        query = "SELECT * FROM sms_messages WHERE " + " AND ".join(where) + " ORDER BY created_at DESC LIMIT ?"
-        args.append(limit)
-        with self.connect() as conn:
-            return [dict(row) for row in conn.execute(query, args).fetchall()]
+            stmt = stmt.where(SmsMessage.phone == phone)
+        stmt = stmt.order_by(SmsMessage.created_at.desc()).limit(limit)
+        with Session(self.engine) as session:
+            return [self.model_to_dict(message) for message in session.scalars(stmt)]
 
     def upsert_application_task(self, offer_id: str, user_id: str = DEFAULT_USER_ID) -> tuple[dict[str, Any], bool]:
         offer = self.get_offer(offer_id)
