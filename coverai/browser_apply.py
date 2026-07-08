@@ -23,6 +23,8 @@ import json
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from .platforms import absolute_profile_dir, playwright_available
 
@@ -557,6 +559,33 @@ def prepare_autofill(packet: dict[str, Any], scan: dict[str, Any]) -> dict[str, 
 HUMAN_ONLY_FIELDS = frozenset({"consent_gdpr"})
 
 
+def _resolve_artifact_path(ref: str, packet: dict[str, Any]) -> str | None:
+    """Translate an 'artifact:<id>' reference into a real local file path, or None.
+
+    Marie names uploads symbolically (cv_upload -> "artifact:art_cv_..."), never as a raw
+    path. The packet carries its own resolution table under `artifacts`: a list of
+    ArtifactRef objects, each with an `artifact_id` and a `storage_ref` file:// URL. We look
+    the id up there and turn the URL into a filesystem path Playwright can upload.
+
+    Fail-closed: returns None if the ref is malformed, the artifact is absent, its storage is
+    not a local file, or the file does not exist -- so an unresolved CV skips the upload
+    rather than erroring or attaching the wrong document.
+    """
+    if not ref.startswith("artifact:"):
+        return None
+    artifact_id = ref[len("artifact:"):]
+    for art in packet.get("artifacts", []):
+        if art.get("artifact_id") != artifact_id:
+            continue
+        storage = art.get("storage_ref", "")
+        if not storage.startswith("file://"):
+            return None  # a link/remote artifact can't be handed to a file input
+        # file:///home/j3/.../cv.pdf -> /home/j3/.../cv.pdf (url2pathname also decodes %20 etc.)
+        path = url2pathname(urlparse(storage).path)
+        return path if Path(path).exists() else None
+    return None
+
+
 def fill_form(page: Any, packet: dict[str, Any], scan: dict[str, Any] | None = None) -> dict[str, Any]:
     """Fill the mapped fields on an ALREADY-OPEN, human-blessed form. Never submits.
 
@@ -616,10 +645,15 @@ def fill_form(page: Any, packet: dict[str, Any], scan: dict[str, Any] | None = N
         ctype = target["control_type"]
         try:
             if ctype == "file":
-                if value.startswith("artifact:") or not Path(value).exists():
+                # Resolve an "artifact:<id>" ref via the packet's own artifacts table;
+                # a bare path (rare) is used as-is. Either way we only upload a real file.
+                path = _resolve_artifact_path(value, packet) if value.startswith("artifact:") else value
+                if not path or not Path(path).exists():
                     record(logical, "file_needs_real_path", sensitive)
                     continue
-                loc.set_input_files(value, timeout=8000)
+                loc.set_input_files(path, timeout=8000)
+                record(logical, "filled", sensitive, packet_status=packet_status, file=Path(path).name)
+                continue
             elif ctype == "checkbox":
                 loc.check(timeout=8000)
             elif target.get("control_type") == "select":

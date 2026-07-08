@@ -92,13 +92,47 @@ class FillFormContractTests(unittest.TestCase):
         self.assertEqual(skipped.get("consent_gdpr"), "skipped_human_only")
         self.assertFalse(page.locator("#noPolicy").is_checked())
 
-        # a bare artifact ref is not a real file path -> upload skipped, not errored
+        # a bare artifact ref with no resolution table -> upload skipped, not errored
         self.assertEqual(skipped.get("cv_upload"), "file_needs_real_path")
 
         # and we NEVER submit
         self.assertFalse(record["submitted"])
         self.assertFalse(page.evaluate("window.__submitted"))
         page.close()
+
+    def test_cv_upload_resolves_artifact_ref_to_real_file(self):
+        # WP-H4 follow-up: a cv_upload artifact ref that the packet's `artifacts` table
+        # resolves to a real local file is actually uploaded into the (Shadow-DOM) input.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            cv_path = Path(td) / "julien_cv.pdf"
+            cv_path.write_bytes(b"%PDF-1.4 fake cv for test\n")
+            packet = _packet(approved=True)
+            for f in packet["fields"]:
+                if f["name"] == "cv_upload":
+                    f["value"] = "artifact:art_cv_test"
+            packet["artifacts"] = [
+                {"artifact_id": "art_cv_test", "kind": "pdf",
+                 "storage_ref": cv_path.as_uri()},  # file:///.../julien_cv.pdf
+            ]
+
+            page = self._fresh_page()
+            record = fill_form(page, packet)
+            filled = {e["logical"]: e for e in record["filled"]}
+
+            # the resolver turned the ref into a path and the record names the file
+            self.assertIn("cv_upload", filled)
+            self.assertEqual(filled["cv_upload"]["file"], "julien_cv.pdf")
+
+            # readback: the file object actually landed on the input in the Shadow DOM
+            cv = map_fields(scan_current(page))["mapped"]["cv_upload"]
+            loc = page.locator(cv["selector"]).nth(cv["selector_index"])
+            landed = loc.evaluate("el => el.files.length ? el.files[0].name : null")
+            self.assertEqual(landed, "julien_cv.pdf")
+
+            # still never submits
+            self.assertFalse(record["submitted"])
+            page.close()
 
 
 if __name__ == "__main__":
