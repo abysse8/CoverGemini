@@ -15,7 +15,13 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from coverai.browser_apply import fill_form, map_fields, playwright_available, scan_current
+from coverai.browser_apply import (
+    fill_form,
+    map_fields,
+    playwright_available,
+    scan_current,
+    submit_form,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "shadow_apply_form.html"
 
@@ -133,6 +139,45 @@ class FillFormContractTests(unittest.TestCase):
             # still never submits
             self.assertFalse(record["submitted"])
             page.close()
+
+    # --- WP-H5: the final-submit gate -------------------------------------------------
+    @staticmethod
+    def _submit_approval(offer_ref, *, status="approved", risk="final_submit", bind=True):
+        bound = offer_ref if bind else "offer:someone_else"
+        return {"approval_id": "apr_1", "task_id": "app_1", "status": status,
+                "risk_level": risk, "actions": [{"type": "final_submit", "offer_ref": bound}]}
+
+    def test_submit_refuses_without_approval(self):
+        page = self._fresh_page()
+        rec = submit_form(page, {"offer_ref": "offer:x"},
+                          self._submit_approval("offer:x", status="pending"))
+        self.assertFalse(rec["submitted"])
+        self.assertFalse(page.evaluate("window.__submitted"))  # button never clicked
+        page.close()
+
+    def test_submit_refuses_wrong_risk_level(self):
+        page = self._fresh_page()
+        rec = submit_form(page, {"offer_ref": "offer:x"},
+                          self._submit_approval("offer:x", risk="browser_autofill"))
+        self.assertFalse(rec["submitted"])
+        self.assertFalse(page.evaluate("window.__submitted"))
+        page.close()
+
+    def test_submit_refuses_approval_bound_to_a_different_offer(self):
+        page = self._fresh_page()
+        rec = submit_form(page, {"offer_ref": "offer:x"},
+                          self._submit_approval("offer:x", bind=False))
+        self.assertEqual(rec["refused"], "approval_not_bound_to_offer")
+        self.assertFalse(page.evaluate("window.__submitted"))
+        page.close()
+
+    def test_submit_clicks_only_under_valid_bound_approval(self):
+        page = self._fresh_page()
+        rec = submit_form(page, {"offer_ref": "offer:x"}, self._submit_approval("offer:x"))
+        self.assertTrue(rec["submitted"])
+        self.assertEqual(rec["clicked"], "envoyer ma candidature")
+        self.assertTrue(page.evaluate("window.__submitted"))  # the real button fired
+        page.close()
 
 
 if __name__ == "__main__":

@@ -729,6 +729,76 @@ def fill_form(page: Any, packet: dict[str, Any], scan: dict[str, Any] | None = N
     }
 
 
+# The submit affordances Helene will click, most-specific first. A final submit is the highest
+# risk act, so we match candidature-submit text -- never a bare "postuler" that might just
+# re-open the apply flow rather than send the application.
+_SUBMIT_TEXTS = [
+    "envoyer ma candidature", "soumettre ma candidature", "valider ma candidature",
+    "envoyer la candidature", "submit application", "send application", "submit my application",
+    "postuler maintenant", "soumettre", "valider et envoyer", "envoyer",
+]
+
+
+def _submit_approval_ok(approval: Any, packet: dict[str, Any]) -> tuple[bool, str]:
+    """Is `approval` a valid final-submit grant bound to THIS packet? -> (ok, reason).
+
+    Mirrors contracts/approval-request.schema.json: status must be 'approved' and risk_level
+    'final_submit'. The grant must also be BOUND to this application -- an action naming the
+    same offer_ref -- so an approval issued for one application can never submit another.
+    """
+    if not isinstance(approval, dict):
+        return False, "no_approval"
+    if approval.get("status") != "approved":
+        return False, f"approval_status:{approval.get('status')}"
+    if approval.get("risk_level") != "final_submit":
+        return False, f"approval_risk:{approval.get('risk_level')}"
+    offer = packet.get("offer_ref")
+    actions = approval.get("actions") or []
+    if offer and not any(isinstance(a, dict) and a.get("offer_ref") == offer for a in actions):
+        return False, "approval_not_bound_to_offer"
+    return True, "ok"
+
+
+def submit_form(page: Any, packet: dict[str, Any], approval: Any,
+                scan: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Click the form's real submit control -- the ONLY place Helene ever submits (WP-H5).
+
+    Fail-closed SECOND gate. approved_for_autofill (which unlocks *filling*) is deliberately not
+    enough here: a final submit needs a SEPARATE approval, at risk_level 'final_submit', bound to
+    this exact application. Refuses unless that approval is valid and bound, then clicks the
+    submit affordance once and records what it did. The caller must not re-invoke after success.
+    """
+    ok, reason = _submit_approval_ok(approval, packet)
+    if not ok:
+        return {"submitted": False, "refused": reason, "offer_ref": packet.get("offer_ref")}
+
+    target_url = (scan or {}).get("final_url") or (scan or {}).get("requested_url") or page.url
+
+    target, clicked = None, None
+    for text in _SUBMIT_TEXTS:
+        loc = page.locator(f"button:has-text('{text}'), a:has-text('{text}')").filter(visible=True)
+        if loc.count() > 0:
+            target, clicked = loc.first, text
+            break
+    if target is None:  # fall back to a real submit-typed control inside the form
+        loc = page.locator("button[type=submit], input[type=submit]").filter(visible=True)
+        if loc.count() > 0:
+            target, clicked = loc.first, "[submit-typed control]"
+    if target is None:
+        return {"submitted": False, "refused": "no_submit_control",
+                "offer_ref": packet.get("offer_ref"), "target_url": target_url}
+
+    try:
+        target.click(timeout=8000)
+    except Exception as error:  # noqa: BLE001 -- report; do not raise on the risky path
+        return {"submitted": False, "refused": f"click_failed:{str(error)[:60]}",
+                "offer_ref": packet.get("offer_ref"), "target_url": target_url}
+
+    return {"submitted": True, "clicked": clicked, "offer_ref": packet.get("offer_ref"),
+            "target_url": target_url,
+            "note": "final submit clicked under an explicit, bound final_submit approval"}
+
+
 def _cli() -> None:
     if len(sys.argv) >= 3 and sys.argv[1] == "scan":
         url = sys.argv[2]
