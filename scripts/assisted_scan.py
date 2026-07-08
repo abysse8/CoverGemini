@@ -18,6 +18,7 @@ or submits.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -35,7 +36,9 @@ CHROME = Path.home() / ".local/opt/chrome/opt/google/chrome/chrome"
 _ADVANCE = ["Je suis intéressé", "intéressé", "Postuler", "I'm interested", "Apply", "Candidater"]
 _CONSENT = ["Accept", "Accepter", "Tout accepter", "J'accepte"]
 
-WAIT_SECONDS = 240  # how long to give the human to clear the CAPTCHA
+# Human time to log in / clear the CAPTCHA / reach the form. Override for login-heavy
+# first runs (France Travail Connect) with ASSISTED_WAIT=300.
+WAIT_SECONDS = int(os.environ.get("ASSISTED_WAIT", "240"))
 
 
 def _click_first(page, texts, timeout=2500) -> bool:
@@ -58,6 +61,11 @@ def main(argv: list[str]) -> int:
     profile = argv[1] if len(argv) > 1 else ".coverai-browser/users/julien/smartrecruiters"
     out = argv[2] if len(argv) > 2 else "scripts/last_assisted_scan.json"
 
+    # MANUAL mode (ASSISTED_MANUAL=1): the tool never clicks apply/re-advance; the human
+    # drives login + navigation and the loop only watches and captures. Needed for
+    # login-gated sites where an auto-click would disrupt the human mid-login.
+    manual = os.environ.get("ASSISTED_MANUAL") == "1"
+
     chrome = str(CHROME) if CHROME.exists() else None
     launch_kw = dict(
         headless=False,
@@ -79,10 +87,16 @@ def main(argv: list[str]) -> int:
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(2500)
             _click_first(page, _CONSENT, timeout=1500)
-            advanced = _click_first(page, _ADVANCE, timeout=4000)
-            print(f"[nav] advanced to form: {advanced}")
-            print("\n>>> A Chrome window is open.")
-            print(">>> If you see a CAPTCHA ('prove you are human' / a puzzle), SOLVE it.")
+            if manual:
+                print("\n>>> A Chrome window is open (MANUAL mode -- I will NOT click for you).")
+                print(">>> 1) Log into France Travail Connect if prompted.")
+                print(">>> 2) Click 'Postuler' and reach the candidature form yourself.")
+                print(">>> 3) Solve any CAPTCHA. The moment the form appears, I capture it (read-only).")
+            else:
+                advanced = _click_first(page, _ADVANCE, timeout=4000)
+                print(f"[nav] advanced to form: {advanced}")
+                print("\n>>> A Chrome window is open.")
+                print(">>> If you see a CAPTCHA ('prove you are human' / a puzzle), SOLVE it.")
             print(f">>> Waiting up to {WAIT_SECONDS}s for the application form to appear...\n", flush=True)
 
             captured = None
@@ -92,36 +106,46 @@ def main(argv: list[str]) -> int:
             last_print = 0.0
             while time.time() - start < WAIT_SECONDS:
                 page.wait_for_timeout(2000)
-                s = scan_current(page)
-                ctrls = s.get("controls", [])
-                captcha = s.get("captcha_detected")
-
-                if not captcha and ctrls and _looks_like_application(ctrls):
-                    captured = s
+                # Follow popups/new tabs: the apply flow often opens the real form in a NEW
+                # window (France Travail -> partner ATS like Vinci Energies). Scan EVERY open
+                # page in the context, not just the first, and capture the one that is a form.
+                any_captcha = False
+                main_fields = 0
+                for pg in list(ctx.pages):
+                    try:
+                        s = scan_current(pg)
+                    except Exception:  # noqa: BLE001 -- page mid-load / navigating; skip this tick
+                        continue
+                    ctrls = s.get("controls", [])
+                    if pg is page:
+                        main_fields = len(ctrls)
+                    if s.get("captcha_detected"):
+                        any_captcha = True
+                        if "oneclick" in (s.get("final_url") or ""):
+                            form_url = s.get("final_url")
+                        continue
+                    if ctrls and _looks_like_application(ctrls):
+                        captured = s
+                        break
+                if captured:
                     break
 
-                # While the CAPTCHA is up, note the form URL it is guarding.
-                if captcha and "oneclick" in (s.get("final_url") or ""):
-                    form_url = s.get("final_url")
-
-                # CAPTCHA cleared but we are not on the form (dropped back to the job
-                # page): re-enter the form. Try re-navigating to the guarded URL first
-                # (clearance cookie is now set), else re-click the apply button.
+                # (Non-manual only) CAPTCHA cleared but no form yet: re-enter the form.
                 now = time.time()
-                if not captcha and not (ctrls and _looks_like_application(ctrls)):
-                    if now - last_readvance > 6:
-                        try:
-                            if form_url:
-                                page.goto(form_url, wait_until="domcontentloaded", timeout=30000)
-                            else:
-                                _click_first(page, _ADVANCE, timeout=3000)
-                        except Exception:  # noqa: BLE001
-                            pass
-                        last_readvance = now
+                if not manual and not any_captcha and now - last_readvance > 6:
+                    try:
+                        if form_url:
+                            page.goto(form_url, wait_until="domcontentloaded", timeout=30000)
+                        else:
+                            _click_first(page, _ADVANCE, timeout=3000)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    last_readvance = now
 
                 if now - last_print > 8:
                     left = int(WAIT_SECONDS - (now - start))
-                    print(f"   ...waiting (captcha={captcha}, fields={len(ctrls)}, {left}s left)", flush=True)
+                    print(f"   ...waiting (captcha={any_captcha}, windows={len(ctx.pages)}, "
+                          f"ft_tab_fields={main_fields}, {left}s left)", flush=True)
                     last_print = now
 
             if captured:

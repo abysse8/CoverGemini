@@ -80,6 +80,9 @@ KNOWN_ATS = {
     "linkedin": "linkedin.com",
     "apec": "apec.fr",
     "jobteaser": "jobteaser.com",
+    "francetravail": "francetravail.fr",      # ex-Pole emploi; candidat.francetravail.fr
+    "poleemploi": "pole-emploi.fr",           # legacy domain, still redirects live
+    "vinci": "jobs.vinci.com",                # partner ATS France Travail redirects into
 }
 
 
@@ -288,7 +291,10 @@ def _kind_ok(logical_kind: str, control: dict[str, Any]) -> bool:
     if logical_kind == "textarea":
         return control["tag"] == "textarea"
     if logical_kind == "checkbox":
-        return ctype in ("checkbox", "radio")
+        # A consent is a checkbox ("I agree"), never a Yes/No radio. Excluding radios stops
+        # consent_gdpr from stealing a radio whose name merely contains "consent" (Vinci's
+        # #consent-yes), leaving the real GDPR checkbox for the required-checkbox fallback.
+        return ctype == "checkbox"
     # "text" logical fields accept any single-line text-like input
     return ctype not in ("file", "checkbox", "radio") and control["tag"] != "textarea"
 
@@ -312,6 +318,12 @@ def _looks_like_application(controls: list[dict[str, Any]]) -> bool:
     if any(c["type"] == "password" for c in controls):
         return False
     if any(m in blob for m in ("session_key", "mot de passe", "sign in", "connexion", "s'identifier")):
+        return False
+    # France Travail (and peers) ship a "Signaler cette offre" report dialog that also carries
+    # name + email fields but is NOT an application. Its report reasons are the tell-tale: no
+    # real candidature form offers "tentative d'escroquerie" as a choice.
+    if any(m in blob for m in ("escroquerie", "signaler cette offre", "offre commerciale",
+                               "ne correspond pas", "n'existe plus", "tentative d'escroquerie")):
         return False
     has_email = any(c["type"] == "email" or "mail" in (c["label"] + c["name"]).lower() for c in controls)
     has_identity = any(
