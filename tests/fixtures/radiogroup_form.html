@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="fr">
+<head><meta charset="utf-8"><title>radiogroup fixture</title></head>
+<body>
+<!-- A required radio group whose QUESTION lives in the <legend>, not the option labels.
+     The scanner must recover "...partenaires ?" (group_label), not just "Oui"/"Non". -->
+<form>
+  <fieldset>
+    <legend>Acceptez-vous d'être contacté par nos partenaires ?</legend>
+    <label><input type="radio" name="partners" value="yes" required> Oui</label>
+    <label><input type="radio" name="partners" value="no" required> Non</label>
+  </fieldset>
+  <label for="email">E-mail</label><input id="email" type="email" name="email" required>
+  <label for="nom">Nom</label><input id="nom" name="nom" required>
+  <button type="submit">Envoyer</button>
+</form>
+</body>
+</html>

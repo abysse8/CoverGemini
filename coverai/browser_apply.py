@@ -136,6 +136,28 @@ _SCAN_JS = r"""
     }
     return { inDialog, inForm, inChrome };
   };
+  // The QUESTION a radio/checkbox group answers -- its own label is just the option
+  // ("Oui"/"Non"), useless to Marie. Climb to the enclosing <fieldset>'s <legend>, or a
+  // role=group/radiogroup's aria-label, to recover the actual question text.
+  const groupLabelFor = (el) => {
+    let node = el;
+    while (node) {
+      if (node.nodeType === 1) {
+        const tag = (node.tagName || '').toLowerCase();
+        const role = ((node.getAttribute && node.getAttribute('role')) || '').toLowerCase();
+        if (tag === 'fieldset') {
+          const lg = node.querySelector('legend');
+          if (lg && lg.innerText.trim()) return lg.innerText.trim().slice(0, 160);
+        }
+        if (role === 'group' || role === 'radiogroup') {
+          const al = node.getAttribute('aria-label');
+          if (al && al.trim()) return al.trim().slice(0, 160);
+        }
+      }
+      node = node.parentNode || node.host || null;  // shadow root -> host
+    }
+    return '';
+  };
   const out = [];
   const seen = new Set();
   // Walk the light DOM AND recurse into every open shadow root. Modern ATS forms
@@ -156,6 +178,7 @@ _SCAN_JS = r"""
         id: el.id || '',
         selector: cssSel(el),
         label: labelFor(el),
+        group_label: (type === 'radio' || type === 'checkbox') ? groupLabelFor(el) : '',
         placeholder: el.getAttribute('placeholder') || '',
         required: el.required || el.getAttribute('aria-required') === 'true',
         visible: rect.width > 0 && rect.height > 0,
@@ -520,6 +543,40 @@ def map_fields(scan: dict[str, Any]) -> dict[str, Any]:
 
     unmapped = [c for c in controls if _ctrl_key(c) not in used]
     return {"mapped": mapping, "unmapped_controls": unmapped}
+
+
+def unmapped_questions(scan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Required controls that map to NO known logical field -- the questions to feed Marie.
+
+    These are the fields Helene cannot answer from a packet, so Marie must source or generate an
+    answer (and decide reusable-general vs per-offer). Radio options sharing a group (same `name`)
+    collapse into ONE question carrying its choices; the question text prefers the group's legend
+    (group_label) over the bare option label. Each item is shaped like an application_questions
+    row Marie can ingest. Read-only; derived from a scan.
+    """
+    required = [c for c in map_fields(scan)["unmapped_controls"] if c.get("required")]
+    ats = scan.get("ats")
+
+    def group_key(c: dict[str, Any]) -> str:
+        return c.get("name") or c.get("group_label") or c.get("label") or c["selector"]
+
+    out: list[dict[str, Any]] = []
+    seen_radio_groups: set[str] = set()
+    for c in required:
+        if c["type"] == "radio":
+            key = group_key(c)
+            if key in seen_radio_groups:
+                continue
+            seen_radio_groups.add(key)
+            choices = [r.get("label", "") for r in required if r["type"] == "radio" and group_key(r) == key]
+            out.append({"label": c.get("group_label") or c.get("name") or "(unlabeled choice)",
+                        "field_type": "radio", "required": True,
+                        "options": [o for o in choices if o], "selector": c["selector"], "ats": ats})
+        else:
+            out.append({"label": c.get("group_label") or c.get("label") or c.get("name") or "",
+                        "field_type": c["type"], "required": True,
+                        "options": c.get("options", []), "selector": c["selector"], "ats": ats})
+    return out
 
 
 def prepare_autofill(packet: dict[str, Any], scan: dict[str, Any]) -> dict[str, Any]:

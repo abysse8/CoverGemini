@@ -21,9 +21,11 @@ from coverai.browser_apply import (
     playwright_available,
     scan_current,
     submit_form,
+    unmapped_questions,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "shadow_apply_form.html"
+RADIO_FIXTURE = Path(__file__).parent / "fixtures" / "radiogroup_form.html"
 
 
 def _packet(approved: bool) -> dict:
@@ -177,6 +179,22 @@ class FillFormContractTests(unittest.TestCase):
         self.assertTrue(rec["submitted"])
         self.assertEqual(rec["clicked"], "envoyer ma candidature")
         self.assertTrue(page.evaluate("window.__submitted"))  # the real button fired
+        page.close()
+
+    def test_radio_group_question_is_recovered_from_the_legend(self):
+        # The scanner must carry the <legend> as group_label so unmapped_questions gives Marie
+        # the real question, not the bare "Oui"/"Non" option labels.
+        page = self.browser.new_page()
+        page.goto(RADIO_FIXTURE.as_uri(), wait_until="domcontentloaded")
+        page.wait_for_timeout(150)
+        scan = scan_current(page)
+        radios = [c for c in scan["controls"] if c["type"] == "radio"]
+        self.assertTrue(radios and all("partenaires" in c["group_label"].lower() for c in radios))
+
+        qs = [q for q in unmapped_questions(scan) if q["field_type"] == "radio"]
+        self.assertEqual(len(qs), 1)                              # collapsed to one question
+        self.assertIn("partenaires", qs[0]["label"].lower())     # legend text, not "Oui"/"Non"
+        self.assertEqual(sorted(qs[0]["options"]), ["Non", "Oui"])
         page.close()
 
 

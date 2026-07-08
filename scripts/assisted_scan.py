@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from playwright.sync_api import sync_playwright  # noqa: E402
 
-from coverai.browser_apply import _looks_like_application, scan_current  # noqa: E402
+from coverai.browser_apply import _looks_like_application, scan_current, unmapped_questions  # noqa: E402
 
 # Real Chrome, extracted from the .deb into the home dir (no admin install).
 CHROME = Path.home() / ".local/opt/chrome/opt/google/chrome/chrome"
@@ -167,6 +167,12 @@ def main(argv: list[str]) -> int:
                 for c in captured["controls"]:
                     lbl = (c["label"] or c["name"] or c["placeholder"] or "").replace("\n", " ")[:50]
                     print(f"   {c['type']:10s} req={int(c['required'])} | {lbl}")
+                questions = unmapped_questions(captured)
+                if questions:
+                    print(f"\n[questions for Marie] {len(questions)} required field(s) with no known answer:")
+                    for q in questions:
+                        opts = f"  options={q['options']}" if q["options"] else ""
+                        print(f"   ? [{q['field_type']}] {(q['label'] or '(unlabeled)')[:60]}{opts}")
                 return 0
             print("\n[TIMEOUT] Form not reached (CAPTCHA unsolved, or a different flow). "
                   "Re-run and solve the challenge, or navigate to the form manually in the window.")
