@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="fr">
+<head><meta charset="utf-8"><title>Fixture apply form</title></head>
+<body>
+<!-- Mirrors the real SmartRecruiters oneclick form: inputs live inside Shadow DOM
+     (web components), two file inputs share the id "file-input" across two shadow roots,
+     and a submit button records whether it was ever clicked. Local + offline. -->
+<div id="host1"></div>
+<div id="host2"></div>
+<button id="realsubmit">Envoyer ma candidature</button>
+<script>
+  window.__submitted = false;
+  function mk(host, html) { const r = host.attachShadow({mode: 'open'}); r.innerHTML = html; return r; }
+  mk(document.getElementById('host1'), `
+    <label for="first-name-input">Prénom*</label><input id="first-name-input" required>
+    <label for="last-name-input">Nom*</label><input id="last-name-input" required>
+    <label for="email-input">E-mail*</label><input id="email-input" type="email" required>
+    <label for="confirm-email-input">Confirmez votre e-mail*</label><input id="confirm-email-input" type="email" required>
+    <label for="hiring-manager-message-input">Message au recruteur</label>
+    <textarea id="hiring-manager-message-input"></textarea>
+    <label>CV<input id="file-input" type="file" aria-label="Choisissez un fichier"></label>
+    <input id="noPolicy" type="checkbox" required aria-label="Consentement RGPD">
+  `);
+  mk(document.getElementById('host2'), `
+    <label>Lettre<input id="file-input" type="file" aria-label="Choisissez un fichier"></label>
+  `);
+  document.getElementById('realsubmit')
+    .addEventListener('click', () => { window.__submitted = true; });
+</script>
+</body>
+</html>

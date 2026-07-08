@@ -32,13 +32,23 @@ from .platforms import absolute_profile_dir, playwright_available
 # Each logical field maps to keyword hints matched against a control's label, name,
 # id, and placeholder (all lowercased). Keep this list minimal: a field earns a slot
 # only when a real submission page demands it. Extend it from scan evidence, not guesses.
+# Frozen v1 against real-form evidence; see personal-agentic-workflow/work-items/
+# 20260706-forms-vocabulary-freeze.md. Two categories share this table:
+#   * DERIVED targets  -- Helene synthesizes the value (full_name, confirm_email); Marie
+#     never emits these. The fill rule lives in fill_form(), not the packet.
+#   * CANONICAL fields -- the names Marie emits in the packet. This half is the shared
+#     seam (see LOGICAL_FIELD_VOCABULARY below); the hints/kinds here are Helene's.
 LOGICAL_FIELDS: dict[str, dict[str, Any]] = {
+    # --- Helene-derived targets (mapped on the form; value synthesized in fill_form) ---
     "full_name":          {"kind": "text",     "hints": ["full name", "nom complet", "your name", "votre nom"]},
+    "confirm_email":      {"kind": "text",     "hints": ["confirm", "confirmez", "confirmer", "verify email", "re-enter"]},
+    # --- Marie-emitted canonical fields ---
     "first_name":         {"kind": "text",     "hints": ["first name", "prénom", "prenom", "given name"]},
     "last_name":          {"kind": "text",     "hints": ["last name", "surname", "nom de famille", "nom"]},
     "email":              {"kind": "text",     "hints": ["email", "e-mail", "courriel", "adresse mail"]},
     "phone":              {"kind": "text",     "hints": ["phone", "téléphone", "telephone", "portable", "mobile"]},
-    "location":           {"kind": "text",     "hints": ["city", "ville", "location", "localisation", "adresse"]},
+    "location_city":      {"kind": "text",     "hints": ["city", "ville", "town"]},
+    "location_country":   {"kind": "text",     "hints": ["country", "pays", "région", "region", "nationality", "nationalité"]},
     "linkedin_url":       {"kind": "text",     "hints": ["linkedin"]},
     "portfolio_url":      {"kind": "text",     "hints": ["portfolio", "website", "site web", "github"]},
     "cv_upload":          {"kind": "file",     "hints": ["cv", "resume", "résumé", "curriculum"]},
@@ -46,9 +56,11 @@ LOGICAL_FIELDS: dict[str, dict[str, Any]] = {
     "motivation":         {"kind": "textarea", "hints": ["motivation", "cover letter", "message", "pourquoi", "why", "lettre"]},
     "start_date":         {"kind": "text",     "hints": ["start date", "date de début", "disponibilité", "availability", "disponible"]},
     "work_authorization": {"kind": "text",     "hints": ["work authorization", "autorisation de travail", "visa", "permit", "titre de séjour"]},
-    "salary_expectation": {"kind": "text",     "hints": ["salary", "salaire", "prétentions", "pretentions", "rémunération"]},
-    "notice_period":      {"kind": "text",     "hints": ["notice period", "préavis", "preavis"]},
     "consent_gdpr":       {"kind": "checkbox", "hints": ["consent", "consentement", "rgpd", "gdpr", "privacy", "politique de confidentialité"]},
+    # --- PARKED (redline #6): no real form has demanded these yet. Re-activate on evidence.
+    #   "salary_expectation": {"kind": "text", "hints": ["salary", "salaire", "prétentions", "rémunération"]},
+    #   "notice_period":      {"kind": "text", "hints": ["notice period", "préavis", "preavis"]},
+    #   "location":           {"kind": "text", "hints": ["location", "localisation", "adresse", "address"]},
 }
 
 # Known ATS / apply hosts, so evidence can tell us what we are really dealing with.
@@ -74,54 +86,86 @@ KNOWN_ATS = {
 # preceding text) is far simpler against the live DOM than reconstructed server-side.
 _SCAN_JS = r"""
 () => {
-  const cssPath = (el) => {
-    if (el.id) return '#' + CSS.escape(el.id);
-    if (el.name) return el.tagName.toLowerCase() + '[name="' + CSS.escape(el.name) + '"]';
-    const parts = [];
-    let node = el;
-    while (node && node.nodeType === 1 && parts.length < 5) {
-      let sel = node.tagName.toLowerCase();
-      const sibs = node.parentNode ? Array.from(node.parentNode.children).filter(c => c.tagName === node.tagName) : [];
-      if (sibs.length > 1) sel += ':nth-of-type(' + (sibs.indexOf(node) + 1) + ')';
-      parts.unshift(sel);
-      node = node.parentElement;
-    }
-    return parts.join(' > ');
+  // Selector Playwright can resolve. Playwright's CSS engine pierces OPEN shadow roots,
+  // so an #id or [name] captured inside a web component still locates from the page.
+  const cssSel = (el) => {
+    // Tag-qualify so an id shared with a wrapper web-component (common in ATS forms:
+    // <custom-input id="x"> around the real <input id="x">) still targets the fillable one.
+    if (el.id) return el.tagName.toLowerCase() + '#' + CSS.escape(el.id);
+    if (el.getAttribute('name')) return el.tagName.toLowerCase() + '[name="' + CSS.escape(el.getAttribute('name')) + '"]';
+    if (el.getAttribute('aria-label')) return el.tagName.toLowerCase() + '[aria-label="' + CSS.escape(el.getAttribute('aria-label')) + '"]';
+    return el.tagName.toLowerCase();
   };
+  // Resolve the label within the element's OWN root (document or a shadow root), because
+  // label[for=]/aria-labelledby targets live in the same tree, not the top document.
   const labelFor = (el) => {
-    if (el.id) {
-      const l = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+    const root = el.getRootNode();
+    if (el.id && root.querySelector) {
+      const l = root.querySelector('label[for="' + CSS.escape(el.id) + '"]');
       if (l && l.innerText.trim()) return l.innerText.trim();
     }
     const anc = el.closest('label');
     if (anc && anc.innerText.trim()) return anc.innerText.trim();
     if (el.getAttribute('aria-label')) return el.getAttribute('aria-label').trim();
     const lb = el.getAttribute('aria-labelledby');
-    if (lb) { const t = document.getElementById(lb); if (t && t.innerText.trim()) return t.innerText.trim(); }
-    // fall back to nearest preceding text node in the same container
+    if (lb && root.getElementById) { const t = root.getElementById(lb); if (t && t.innerText.trim()) return t.innerText.trim(); }
     let p = el.previousElementSibling;
     while (p) { if (p.innerText && p.innerText.trim()) return p.innerText.trim().slice(0, 120); p = p.previousElementSibling; }
     return '';
   };
+  // Which region a control lives in. Climbs ancestors, crossing shadow boundaries via
+  // the host, so we can keep application fields (in a <form>/dialog) and drop page chrome
+  // (nav/header/footer/search). Lets the catalog stop eating global search boxes etc.
+  const regionOf = (el) => {
+    let node = el, inDialog = false, inForm = false, inChrome = false;
+    while (node) {
+      if (node.nodeType === 1) {
+        const tag = (node.tagName || '').toLowerCase();
+        const role = ((node.getAttribute && node.getAttribute('role')) || '').toLowerCase();
+        if (tag === 'form') inForm = true;
+        if (tag === 'dialog' || role === 'dialog') inDialog = true;
+        if (['nav', 'header', 'footer'].includes(tag)
+            || ['navigation', 'search', 'banner', 'contentinfo'].includes(role)) inChrome = true;
+      }
+      node = node.parentNode || node.host || null;  // shadow root -> host
+    }
+    return { inDialog, inForm, inChrome };
+  };
   const out = [];
-  for (const el of document.querySelectorAll('input, select, textarea')) {
-    const type = (el.getAttribute('type') || el.tagName.toLowerCase()).toLowerCase();
-    if (['hidden', 'submit', 'button', 'reset', 'image'].includes(type)) continue;
-    const rect = el.getBoundingClientRect();
-    out.push({
-      tag: el.tagName.toLowerCase(),
-      type,
-      name: el.getAttribute('name') || '',
-      id: el.id || '',
-      selector: cssPath(el),
-      label: labelFor(el),
-      placeholder: el.getAttribute('placeholder') || '',
-      required: el.required || el.getAttribute('aria-required') === 'true',
-      visible: rect.width > 0 && rect.height > 0,
-      options: el.tagName.toLowerCase() === 'select'
-        ? Array.from(el.options).map(o => o.text.trim()).slice(0, 25) : [],
-    });
-  }
+  const seen = new Set();
+  // Walk the light DOM AND recurse into every open shadow root. Modern ATS forms
+  // (SmartRecruiters) render their inputs inside web components; a plain
+  // document.querySelectorAll sees only the ~1 field that leaks into the light DOM.
+  const collect = (root) => {
+    for (const el of root.querySelectorAll('input, select, textarea')) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      const type = (el.getAttribute('type') || el.tagName.toLowerCase()).toLowerCase();
+      if (['hidden', 'submit', 'button', 'reset', 'image'].includes(type)) continue;
+      const rect = el.getBoundingClientRect();
+      const region = regionOf(el);
+      out.push({
+        tag: el.tagName.toLowerCase(),
+        type,
+        name: el.getAttribute('name') || '',
+        id: el.id || '',
+        selector: cssSel(el),
+        label: labelFor(el),
+        placeholder: el.getAttribute('placeholder') || '',
+        required: el.required || el.getAttribute('aria-required') === 'true',
+        visible: rect.width > 0 && rect.height > 0,
+        in_dialog: region.inDialog,
+        in_form: region.inForm,
+        in_chrome: region.inChrome,
+        options: el.tagName.toLowerCase() === 'select'
+          ? Array.from(el.options).map(o => o.text.trim()).slice(0, 25) : [],
+      });
+    }
+    for (const el of root.querySelectorAll('*')) {
+      if (el.shadowRoot) collect(el.shadowRoot);
+    }
+  };
+  collect(document);
   // Candidate "apply" affordances so we can trace posting -> form.
   const applyLinks = [];
   for (const a of document.querySelectorAll('a, button')) {
@@ -142,6 +186,55 @@ def _detect_ats(url: str) -> str:
         if host in low:
             return name
     return "unknown"
+
+
+# Anti-bot / CAPTCHA services. If a frame is served from one of these, an automated
+# browser has been challenged and the real form is unreachable headless -- this is the
+# signal the assistive (human-in-the-loop) model exists to handle.
+CAPTCHA_HOSTS = (
+    "captcha-delivery.com",  # DataDome
+    "datadome",
+    "recaptcha",
+    "hcaptcha.com",
+    "arkoselabs.com",
+    "funcaptcha",
+    "perimeterx",
+    "px-cloud",
+)
+
+
+def _scan_all_frames(page: Any) -> dict[str, Any]:
+    """Scan the top document AND child iframes; flag any CAPTCHA frame.
+
+    Modern ATS apply forms (SmartRecruiters, Workday) render inside iframes, and some
+    sit behind a CAPTCHA iframe. Scanning only the top document misses both, and reports
+    a misleading "0 controls". This gathers controls across frames and names the blocker.
+    """
+    controls: list[dict[str, Any]] = []
+    captcha_host = ""
+    for frame in page.frames:
+        furl = (frame.url or "").lower()
+        if any(h in furl for h in CAPTCHA_HOSTS):
+            captcha_host = frame.url
+            continue
+        try:
+            data = frame.evaluate(_SCAN_JS)
+            controls.extend(data.get("controls", []))
+        except Exception:  # noqa: BLE001 -- cross-origin frame or detached; skip it
+            continue
+    # Shadow-DOM elements can share an id, so a selector like "#file-input" may match
+    # several controls. Record which occurrence each is, so a filler can target it with
+    # locator(selector).nth(selector_index) instead of hitting the wrong field.
+    occurrences: dict[str, int] = {}
+    for c in controls:
+        sel = c["selector"]
+        c["selector_index"] = occurrences.get(sel, 0)
+        occurrences[sel] = c["selector_index"] + 1
+    return {
+        "controls": controls,
+        "captcha_detected": bool(captcha_host),
+        "captcha_host": captcha_host,
+    }
 
 
 def scan_form(
@@ -176,10 +269,7 @@ def scan_form(
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             page.wait_for_timeout(1200)
-            data = page.evaluate(_SCAN_JS)
-            result.update(data)
-            result["final_url"] = page.url
-            result["ats"] = _detect_ats(page.url)
+            result.update(scan_current(page))
         except Exception as error:  # noqa: BLE001 -- evidence tool: report, don't raise
             result["error"] = str(error)
             result.setdefault("controls", [])
@@ -282,14 +372,16 @@ def resolve_apply_target(
                 return result
 
             # Click, racing three outcomes: popup, navigation, or in-page modal.
+            # Aggregators ("Postuler sur le site du recruteur") open a NEW TAB to an
+            # external ATS, and that redirect can be slow -- wait long enough to catch it.
             dest_page = page
             try:
-                with context.expect_page(timeout=6000) as popup_info:
+                with context.expect_page(timeout=12000) as popup_info:
                     target.click()
                 dest_page = popup_info.value  # a new tab opened
                 dest_page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
             except Exception:  # noqa: BLE001 -- no popup; same-tab nav or modal
-                page.wait_for_timeout(2500)
+                page.wait_for_timeout(3000)
                 dest_page = page
             dest_page.wait_for_timeout(1500)
 
@@ -307,9 +399,38 @@ def resolve_apply_target(
     return result
 
 
+def _scope_to_application(controls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the application-form controls, drop page chrome (nav/search/footer).
+
+    Preference order, most-specific first:
+      1. a dialog is open (Easy Apply modal) -> keep only its controls;
+      2. else there is a <form> -> keep only in-form controls;
+      3. else keep everything that is NOT inside nav/header/footer/search.
+    Falls back to the raw list if a rule would empty it (better noisy than blind).
+    """
+    dialog = [c for c in controls if c.get("in_dialog")]
+    if dialog:
+        return dialog
+    in_form = [c for c in controls if c.get("in_form")]
+    if in_form:
+        return in_form
+    not_chrome = [c for c in controls if not c.get("in_chrome")]
+    return not_chrome or controls
+
+
 def scan_current(page: Any) -> dict[str, Any]:
-    """Run the read-only control enumeration against an already-open page."""
-    data = page.evaluate(_SCAN_JS)
+    """Run the read-only control enumeration against an already-open page.
+
+    Merges controls from the top document and any child iframes, flags a CAPTCHA frame,
+    and scopes `controls` to the application form (page chrome kept under `controls_all`).
+    """
+    data = page.evaluate(_SCAN_JS)  # top frame: applyLinks + title
+    frames = _scan_all_frames(page)
+    all_controls = frames["controls"]
+    data["controls_all"] = all_controls
+    data["controls"] = _scope_to_application(all_controls)
+    data["captcha_detected"] = frames["captcha_detected"]
+    data["captcha_host"] = frames["captcha_host"]
     data["final_url"] = page.url
     data["ats"] = _detect_ats(page.url)
     return data
@@ -324,29 +445,66 @@ def _match_field(control: dict[str, Any], hints: list[str]) -> int:
     return sum(1 for h in hints if h in hay)
 
 
+def _ctrl_key(control: dict[str, Any]) -> tuple[str, int]:
+    """Identity of a control, unique even when a selector repeats across shadow roots."""
+    return (control["selector"], control.get("selector_index", 0))
+
+
+def _map_entry(control: dict[str, Any], score: int = 0) -> dict[str, Any]:
+    return {
+        "selector": control["selector"],
+        "selector_index": control.get("selector_index", 0),
+        "control_type": control["type"],
+        "label": control["label"],
+        "required": control["required"],
+        "confidence": "high" if score >= 2 else "low",
+    }
+
+
 def map_fields(scan: dict[str, Any]) -> dict[str, Any]:
     """Map logical field names onto scanned controls. Read-only planning."""
     controls = scan.get("controls", [])
     mapping: dict[str, Any] = {}
-    used: set[str] = set()
+    used: set[tuple[str, int]] = set()
+
+    # Pass 1: keyword match on label/name/id/placeholder.
     for logical, spec in LOGICAL_FIELDS.items():
         best, best_score = None, 0
         for c in controls:
-            if c["selector"] in used or not _kind_ok(spec["kind"], c):
+            if _ctrl_key(c) in used or not _kind_ok(spec["kind"], c):
                 continue
             score = _match_field(c, spec["hints"])
             if score > best_score:
                 best, best_score = c, score
         if best and best_score > 0:
-            used.add(best["selector"])
-            mapping[logical] = {
-                "selector": best["selector"],
-                "control_type": best["type"],
-                "label": best["label"],
-                "required": best["required"],
-                "confidence": "high" if best_score >= 2 else "low",
-            }
-    unmapped = [c for c in controls if c["selector"] not in used]
+            used.add(_ctrl_key(best))
+            mapping[logical] = _map_entry(best, best_score)
+
+    # Pass 2: evidence-driven rules for fields real forms label generically.
+    # (a) File inputs are often just "Choose a file"; assign the non-photo ones in order.
+    free_files = [
+        c for c in controls
+        if c["type"] == "file" and _ctrl_key(c) not in used
+        and "photo" not in (c["label"] + c["name"] + c["id"]).lower()
+    ]
+    for logical in ("cv_upload", "cover_letter_upload"):
+        if logical not in mapping and free_files:
+            c = free_files.pop(0)
+            used.add(_ctrl_key(c))
+            entry = _map_entry(c)
+            entry["by_rule"] = "file_order"
+            mapping[logical] = entry
+    # (b) A required checkbox with a weak label is the GDPR consent box.
+    if "consent_gdpr" not in mapping:
+        for c in controls:
+            if c["type"] == "checkbox" and c["required"] and _ctrl_key(c) not in used:
+                used.add(_ctrl_key(c))
+                entry = _map_entry(c)
+                entry["by_rule"] = "required_checkbox"
+                mapping["consent_gdpr"] = entry
+                break
+
+    unmapped = [c for c in controls if _ctrl_key(c) not in used]
     return {"mapped": mapping, "unmapped_controls": unmapped}
 
 
@@ -391,6 +549,95 @@ def prepare_autofill(packet: dict[str, Any], scan: dict[str, Any]) -> dict[str, 
         "form_fields_not_in_packet": missing_in_packet,
         "unmapped_form_controls": len(field_map["unmapped_controls"]),
         "note": "read-only plan; no values were injected",
+    }
+
+
+# Logical fields a machine must never set on the user's behalf. Consent is a legal act by
+# the human; a start of typing here would be us asserting agreement for them.
+HUMAN_ONLY_FIELDS = frozenset({"consent_gdpr"})
+
+
+def fill_form(page: Any, packet: dict[str, Any], scan: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Fill the mapped fields on an ALREADY-OPEN, human-blessed form. Never submits.
+
+    Safety rules, all fail-closed:
+      * refuses entirely unless packet['approved_for_autofill'] is True;
+      * never touches HUMAN_ONLY_FIELDS (GDPR consent);
+      * never clicks a submit button -- filling a form creates no application;
+      * file uploads are only performed for a real local path, never a bare artifact ref.
+
+    Returns a fill record. Sensitive values are masked in the record, never logged raw.
+    """
+    if not packet.get("approved_for_autofill", False):
+        return {"submitted": False, "filled": [], "skipped": [],
+                "refused": "approved_for_autofill is not True"}
+
+    if scan is None:
+        scan = scan_current(page)
+    mapped = map_fields(scan)["mapped"]
+    packet_fields = {f["name"]: f for f in packet.get("fields", [])}
+    filled: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    def record(logical, status, sensitive=False, **extra):
+        entry = {"logical": logical, "status": status, "sensitive": bool(sensitive)}
+        entry.update(extra)
+        (filled if status == "filled" else skipped).append(entry)
+
+    for logical, target in mapped.items():
+        if logical in HUMAN_ONLY_FIELDS:
+            record(logical, "skipped_human_only")
+            continue
+        # Derived targets: Marie emits neither, so Helene synthesizes the value here.
+        pf = packet_fields.get(logical)
+        if logical == "confirm_email" and pf is None:
+            pf = packet_fields.get("email")           # confirm-email mirrors email
+        if logical == "full_name" and pf is None:
+            # join(first,last) is safe (roles known); splitting a full name is not.
+            first, last = packet_fields.get("first_name"), packet_fields.get("last_name")
+            if first and last and first.get("value") and last.get("value"):
+                ready = first.get("status") == "ready" and last.get("status") == "ready"
+                pf = {"value": f"{first['value']} {last['value']}".strip(),
+                      "status": "ready" if ready else "needs_review"}
+        if pf is None:
+            record(logical, "no_packet_value")
+            continue
+        # Fill confirmed (ready) values AND drafts (needs_review): the human reviews the
+        # whole form before the separate submit approval, so a draft in the real textarea
+        # is useful, not dangerous. Only a value-less / missing field is skipped.
+        packet_status = pf.get("status")
+        if not pf.get("value") or packet_status not in ("ready", "needs_review"):
+            record(logical, f"not_fillable:{packet_status}")
+            continue
+
+        value = str(pf["value"])
+        sensitive = bool(pf.get("sensitive", False))
+        loc = page.locator(target["selector"]).nth(target.get("selector_index", 0))
+        ctype = target["control_type"]
+        try:
+            if ctype == "file":
+                if value.startswith("artifact:") or not Path(value).exists():
+                    record(logical, "file_needs_real_path", sensitive)
+                    continue
+                loc.set_input_files(value, timeout=8000)
+            elif ctype == "checkbox":
+                loc.check(timeout=8000)
+            elif target.get("control_type") == "select":
+                loc.select_option(value, timeout=8000)
+            else:
+                loc.fill(value, timeout=8000)
+            record(logical, "filled", sensitive, packet_status=packet_status)
+        except Exception as error:  # noqa: BLE001 -- one bad field must not abort the rest
+            skipped.append({"logical": logical, "status": "error", "detail": str(error)[:80]})
+
+    return {
+        "offer_ref": packet.get("offer_ref"),
+        "target_url": scan.get("final_url") or scan.get("requested_url"),
+        "ats": scan.get("ats"),
+        "submitted": False,
+        "filled": filled,
+        "skipped": skipped,
+        "note": "fields filled on a blessed session; NOT submitted (final submit needs its own approval)",
     }
 
 
