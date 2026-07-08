@@ -598,6 +598,48 @@ def _resolve_artifact_path(ref: str, packet: dict[str, Any]) -> str | None:
     return None
 
 
+# Logical fields whose packet value is an artifact reference Helene uploads as a FILE:
+# the curated (per-offer) CV and the cover-letter PDF. Marie owns producing these artifacts.
+# (The motivation letter's TEXT form is a plain-value field, `motivation`, not listed here.)
+FILE_ARTIFACT_FIELDS = frozenset({"cv_upload", "cover_letter_upload"})
+
+
+def validate_packet_for_upload(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    """Check that every file-backed field Marie marks fillable resolves to a local file.
+
+    This is Helene's side of the CV / cover-letter contract made checkable: Marie can call it
+    in the producer before flipping a field to 'ready', so a curated CV or motivation PDF that
+    is only a remote reference or a missing file is caught up front instead of being silently
+    skipped at fill time. Advisory and pure: it reads the packet, touches no browser, no form.
+
+    Returns a list of problems (empty list == the packet meets the upload contract). A field
+    that is missing or not ready is NOT a problem -- Helene simply skips it.
+    """
+    problems: list[dict[str, Any]] = []
+    by_name = {f.get("name"): f for f in packet.get("fields", [])}
+    for name in sorted(FILE_ARTIFACT_FIELDS):
+        f = by_name.get(name)
+        if not f or f.get("status") not in ("ready", "needs_review") or not f.get("value"):
+            continue  # not offered / not ready -> skipped at fill, no contract violation
+        value = str(f["value"])
+        if not value.startswith("artifact:"):
+            problems.append({"field": name, "issue": "value_not_artifact_ref",
+                             "detail": f"file field must be 'artifact:<id>', got {value[:40]!r}"})
+            continue
+        art_id = value[len("artifact:"):]
+        art = next((a for a in packet.get("artifacts", []) if a.get("artifact_id") == art_id), None)
+        if art is None:
+            problems.append({"field": name, "issue": "artifact_missing",
+                             "detail": f"no artifacts[] entry with artifact_id {art_id!r}"})
+        elif not str(art.get("storage_ref", "")).startswith("file://"):
+            problems.append({"field": name, "issue": "storage_not_local_file",
+                             "detail": "Helene uploads local files only; storage_ref must be file://"})
+        elif _resolve_artifact_path(value, packet) is None:
+            problems.append({"field": name, "issue": "file_not_found",
+                             "detail": f"{art.get('storage_ref')} does not resolve to an existing file"})
+    return problems
+
+
 def fill_form(page: Any, packet: dict[str, Any], scan: dict[str, Any] | None = None) -> dict[str, Any]:
     """Fill the mapped fields on an ALREADY-OPEN, human-blessed form. Never submits.
 
