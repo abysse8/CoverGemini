@@ -20,6 +20,7 @@ from .models import (
     ApplicationTask,
     Event,
     ExplorerRun,
+    InterviewQuestion,
     Offer,
     Platform,
     QueueItem,
@@ -27,6 +28,7 @@ from .models import (
     SmsReport,
     User,
     UserPlatformAccount,
+    UserProfile,
 )
 
 DEFAULT_USER_ID = "julien"
@@ -132,7 +134,12 @@ class CoverAiStore:
         # SQLAlchemy engine alongside the raw sqlite3 path while methods are
         # converted one table at a time; both read the same file. Built before
         # init_db because seeding runs through the engine.
-        self.engine = create_engine(f"sqlite:///{self.path}")
+        # check_same_thread=False lets pooled connections cross threads, which the
+        # threaded gateway/Flask servers require (SQLite still serializes writes
+        # itself); without it a request thread reusing a connection raises.
+        self.engine = create_engine(
+            f"sqlite:///{self.path}", connect_args={"check_same_thread": False}
+        )
         sqla_event.listen(self.engine, "connect", _enable_foreign_keys)
         self.init_db()
 
@@ -162,6 +169,21 @@ class CoverAiStore:
                     phone TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS user_profile (
+                    user_id TEXT PRIMARY KEY,
+                    first_name TEXT NOT NULL DEFAULT '',
+                    last_name TEXT NOT NULL DEFAULT '',
+                    email TEXT NOT NULL DEFAULT '',
+                    phone TEXT NOT NULL DEFAULT '',
+                    location_city TEXT NOT NULL DEFAULT '',
+                    location_country TEXT NOT NULL DEFAULT '',
+                    linkedin_url TEXT NOT NULL DEFAULT '',
+                    portfolio_url TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
                 );
 
                 CREATE TABLE IF NOT EXISTS platforms (
@@ -302,6 +324,24 @@ class CoverAiStore:
                     FOREIGN KEY (application_id) REFERENCES application_tasks(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS interview_questions (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT 'julien',
+                    offer_id TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'general',
+                    question TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'unknown',
+                    suggested_answer TEXT NOT NULL DEFAULT '',
+                    answer TEXT NOT NULL DEFAULT '',
+                    answer_source TEXT NOT NULL DEFAULT 'unknown',
+                    confidence INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'collected',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id),
+                    FOREIGN KEY (offer_id) REFERENCES offers(id)
+                );
+
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT NOT NULL DEFAULT 'julien',
@@ -330,6 +370,7 @@ class CoverAiStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_application_tasks_user_status ON application_tasks(user_id, status, updated_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_application_tasks_offer ON application_tasks(offer_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_application_questions_app ON application_questions(application_id, status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_interview_questions_offer ON interview_questions(offer_id, status)")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_offers_user_dedupe ON offers(user_id, dedupe_hash)")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_application_tasks_user_offer ON application_tasks(user_id, offer_id)")
             # Clean surface for downstream agents (Coach/Forms): real, non-duplicate
@@ -396,6 +437,122 @@ class CoverAiStore:
         with Session(self.engine) as session:
             user = session.get(User, user_id)
             return self.model_to_dict(user) if user else None
+
+    # Fields the caller is allowed to set on a profile. Excludes user_id (the key)
+    # and the timestamps (managed here), so a stray key can never overwrite them.
+    PROFILE_FIELDS = frozenset({
+        "first_name", "last_name", "email", "phone",
+        "location_city", "location_country", "linkedin_url", "portfolio_url",
+    })
+
+    def get_profile(self, user_id: str = DEFAULT_USER_ID) -> dict[str, Any] | None:
+        with Session(self.engine) as session:
+            profile = session.get(UserProfile, user_id)
+            return self.model_to_dict(profile) if profile else None
+
+    def upsert_profile(self, user_id: str = DEFAULT_USER_ID, **fields: Any) -> dict[str, Any]:
+        """Create or update the identity profile, one row per user.
+
+        Only PROFILE_FIELDS are writable; unknown keys are ignored so a typo can
+        never clobber the key or timestamps. Returns the stored row as a dict.
+        """
+        updates = {key: str(value) for key, value in fields.items() if key in self.PROFILE_FIELDS}
+        now = utc_now()
+        with Session(self.engine) as session:
+            profile = session.get(UserProfile, user_id)
+            if profile is None:
+                profile = UserProfile(user_id=user_id, created_at=now, updated_at=now)
+                session.add(profile)
+            for key, value in updates.items():
+                setattr(profile, key, value)
+            profile.updated_at = now
+            session.commit()
+            return self.model_to_dict(profile)
+
+    # --- interview questions (Helene collects -> Camille coaches) -------------
+    INTERVIEW_FIELDS = frozenset({
+        "category", "question", "source", "suggested_answer",
+        "answer", "answer_source", "confidence", "status",
+    })
+
+    def add_interview_questions(
+        self, offer_id: str, items: list[dict[str, Any]], user_id: str = DEFAULT_USER_ID
+    ) -> list[dict[str, Any]]:
+        """Store collected interview questions for an offer, skipping duplicates.
+
+        `items` are dicts with at least {question}; optional {category, source}.
+        Idempotent on (offer_id, question text) so re-collecting a board does not
+        create duplicates. Returns the rows that were newly inserted.
+        """
+        now = utc_now()
+        inserted: list[dict[str, Any]] = []
+        with Session(self.engine) as session:
+            existing = {
+                row.question
+                for row in session.scalars(
+                    select(InterviewQuestion).where(InterviewQuestion.offer_id == offer_id)
+                )
+            }
+            for item in items:
+                question = str(item.get("question") or "").strip()
+                if not question or question in existing:
+                    continue
+                existing.add(question)
+                row = InterviewQuestion(
+                    id=self.new_id("iq_"),
+                    user_id=user_id,
+                    offer_id=offer_id,
+                    category=str(item.get("category") or "general"),
+                    question=question,
+                    source=str(item.get("source") or "unknown"),
+                    status="collected",
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(row)
+                inserted.append(self.model_to_dict(row))
+            session.commit()
+        return inserted
+
+    def list_interview_questions(
+        self, offer_id: str, user_id: str = DEFAULT_USER_ID, status: str = ""
+    ) -> list[dict[str, Any]]:
+        stmt = select(InterviewQuestion).where(
+            InterviewQuestion.offer_id == offer_id, InterviewQuestion.user_id == user_id
+        )
+        if status:
+            stmt = stmt.where(InterviewQuestion.status == status)
+        stmt = stmt.order_by(InterviewQuestion.created_at)
+        with Session(self.engine) as session:
+            return [self.model_to_dict(row) for row in session.scalars(stmt)]
+
+    def update_interview_question(
+        self, question_id: str, user_id: str = DEFAULT_USER_ID, **fields: Any
+    ) -> dict[str, Any]:
+        updates = {k: v for k, v in fields.items() if k in self.INTERVIEW_FIELDS}
+        if "confidence" in updates:
+            updates["confidence"] = max(0, min(int(updates["confidence"]), 100))
+        with Session(self.engine) as session:
+            row = session.get(InterviewQuestion, question_id)
+            if row is None or row.user_id != user_id:
+                raise KeyError(f"Unknown interview question: {question_id}")
+            for key, value in updates.items():
+                setattr(row, key, value)
+            row.updated_at = utc_now()
+            session.commit()
+            return self.model_to_dict(row)
+
+    def interview_readiness(self, offer_id: str, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+        rows = self.list_interview_questions(offer_id, user_id=user_id)
+        total = len(rows)
+        answered = sum(1 for r in rows if r["status"] == "answered")
+        coached = sum(1 for r in rows if r["suggested_answer"])
+        return {
+            "total": total,
+            "answered": answered,
+            "coached": coached,
+            "percent": round(100 * answered / total) if total else 0,
+        }
 
     def list_platforms(self) -> list[dict[str, Any]]:
         stmt = select(Platform).where(Platform.enabled == 1).order_by(Platform.name)
@@ -1018,6 +1175,25 @@ class CoverAiStore:
                 "artifacts": artifacts,
             },
         }
+
+    def build_contract_packet(
+        self,
+        application_id: str,
+        user_id: str = DEFAULT_USER_ID,
+        **rendered_artifacts: Any,
+    ) -> dict[str, Any]:
+        """The frozen SubmissionPacket contract for one application.
+
+        This is the shape Helene's browser_apply consumes -- the 14-field logical
+        vocabulary, readiness counts, and artifact refs -- as opposed to
+        application_submission_packet() above, which is the internal readiness
+        view. Optional rendered_artifacts (cv_artifact, cover_letter_artifact)
+        are passed through to the producer. Lazy import breaks the
+        storage<->submission_packet module cycle.
+        """
+        from .submission_packet import build_submission_packet
+
+        return build_submission_packet(self, application_id, user_id=user_id, **rendered_artifacts)
 
     def update_application_question(self, question_id: str, user_id: str = DEFAULT_USER_ID, **fields: Any) -> dict[str, Any]:
         allowed = {"answer", "answer_source", "confidence", "status"}

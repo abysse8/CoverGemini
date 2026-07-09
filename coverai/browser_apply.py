@@ -856,6 +856,66 @@ def submit_form(page: Any, packet: dict[str, Any], approval: Any,
             "note": "final submit clicked under an explicit, bound final_submit approval"}
 
 
+# --- Interview-question collection (Helene -> Camille seam) ----------------------
+#
+# Helene collects likely interview questions for a role and hands them to Camille,
+# who drafts job-specific answers. LIVE scraping of a job board / Glassdoor is a
+# later slice (it needs auth + brittle per-site selectors, exactly like the form
+# scanner was built evidence-first). For now this NORMALIZES already-collected
+# question text -- from a captured evidence file or a provided list -- into typed
+# items ready to store. Same interface a live collector will fill later.
+
+# Checked in this order: behavioral and company phrasings ("tell me about a time",
+# "why do you want") are strong intent signals and win over a stray technical
+# keyword (e.g. "debugging") appearing inside a behavioral question.
+_INTERVIEW_CATEGORY_HINTS = {
+    "behavioral": ["tell me about", "describe a time", "describe a", "give an example",
+                   "challenge", "conflict", "disagreed", "weakness", "strength", "teammate",
+                   "deadline", "mistake", "failure", "proud"],
+    "company": ["why do you want", "why us", "why this company", "why our", "know about us",
+                "our product", "our mission", "interested in this role", "this position"],
+    "technical": ["explain", "difference between", "how would you", "how do you", "debug",
+                  "implement", "algorithm", "rtos", "mutex", "semaphore", "memory", "pointer",
+                  "protocol", "interrupt", "kernel", "c++", "register", "firmware", "driver"],
+}
+
+
+def _classify_question(text: str) -> str:
+    low = text.lower()
+    for category, hints in _INTERVIEW_CATEGORY_HINTS.items():
+        if any(hint in low for hint in hints):
+            return category
+    return "general"
+
+
+def collect_interview_questions(
+    raw_items: list[Any], source: str = "job_board"
+) -> list[dict[str, Any]]:
+    """Normalize collected question text into typed items for the store.
+
+    `raw_items` may be plain strings or dicts carrying {question, category?, source?}.
+    Each returned item is {question, category, source}, category inferred from
+    keywords when not given. Blank/duplicate questions are dropped. Read-only: this
+    performs no browsing; it shapes evidence Helene has already gathered.
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        if isinstance(item, dict):
+            question = str(item.get("question") or "").strip()
+            category = str(item.get("category") or "") or _classify_question(question)
+            item_source = str(item.get("source") or source)
+        else:
+            question = str(item or "").strip()
+            category = _classify_question(question)
+            item_source = source
+        if not question or question.lower() in seen:
+            continue
+        seen.add(question.lower())
+        out.append({"question": question, "category": category, "source": item_source})
+    return out
+
+
 def _cli() -> None:
     if len(sys.argv) >= 3 and sys.argv[1] == "scan":
         url = sys.argv[2]

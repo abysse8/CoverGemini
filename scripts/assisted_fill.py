@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
-"""Supervised live fill -- prove WP-H4 injection on a REAL form, with a human watching.
+"""Supervised live fill -- inject a REAL DB-backed submission packet, human watching.
 
 Opens the real apply form in a VISIBLE Chrome window using the blessed profile. You clear
 the CAPTCHA if one appears (the clearance cookie may already be valid). Once the form is
-reachable, fill_form() types the packet values in front of you and STOPS. It never clicks
-submit, never checks the GDPR box, and never uploads a file it cannot verify.
+reachable:
+
+  * WITHOUT --approve: it prints the fill plan (logical field -> selector -> value) and
+    types NOTHING. This is the default, so a bare run can never touch the form.
+  * WITH --approve: fill_form() types the packet values in front of you and STOPS. It
+    never clicks submit, never checks the GDPR box, and never uploads a file it can't
+    verify. --approve is the explicit human approval the contract requires before any fill.
+
+The packet is built by Marie's producer (coverai.submission_packet.build_submission_packet)
+from your profile + the application's answers -- not a hardcoded literal.
 
 Usage (from repo root):
-    python3 scripts/assisted_fill.py <job_url> [profile_dir]
+    python3 scripts/assisted_fill.py <job_url> [--app <application_id>] [--profile <dir>] [--approve]
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import time
@@ -24,28 +33,36 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 from coverai.browser_apply import (  # noqa: E402
     _looks_like_application,
     fill_form,
+    prepare_autofill,
     scan_current,
 )
+from coverai.storage import CoverAiStore  # noqa: E402
+from coverai.submission_packet import build_submission_packet  # noqa: E402
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 CHROME = Path.home() / ".local/opt/chrome/opt/google/chrome/chrome"
 _ADVANCE = ["Je suis intéressé", "intéressé", "Postuler", "I'm interested", "Apply", "Candidater"]
 _CONSENT = ["Accept", "Accepter", "Tout accepter", "J'accepte"]
 WAIT_SECONDS = 200
 
-# A minimal real packet. Values you already use publicly; email marked sensitive.
-# approved_for_autofill=True is what unlocks typing -- set here because YOU are supervising.
-PACKET = {
-    "offer_ref": "offer:off_a6b310e9",
-    "approved_for_autofill": True,
-    "fields": [
-        {"name": "first_name", "value": "Julien", "status": "ready", "source": "user"},
-        {"name": "last_name", "value": "Gonzales", "status": "ready", "source": "user"},
-        {"name": "email", "value": "julienabdougonzales@gmail.com", "status": "ready", "sensitive": True},
-        {"name": "location_city", "value": "Paris", "status": "ready", "source": "user"},
-        {"name": "motivation", "value": "Draft: strong fit for embedded systems; happy to detail.",
-         "status": "needs_review", "source": "generated"},
-    ],
-}
+
+def _load_packet(app_id: str | None, approve: bool) -> dict:
+    """Build the real submission packet, and flip the approval flag iff --approve.
+
+    The producer always emits approved_for_autofill=False; approval is a separate,
+    explicit human act -- here, passing --approve on the command line.
+    """
+    store = CoverAiStore(str(REPO_ROOT / "coverai.db"))
+    if not app_id:
+        apps = store.list_application_tasks()
+        if not apps:
+            raise SystemExit("No application tasks in coverai.db; pass --app <id> or create one.")
+        app_id = apps[0]["id"]  # most recent
+        print(f">>> No --app given; using most recent application: {app_id} ({apps[0].get('company')})")
+    packet = build_submission_packet(store, app_id)
+    packet["approved_for_autofill"] = bool(approve)
+    print(f">>> Packet for {packet['company']}: {packet['readiness']['summary']}")
+    return packet
 
 
 def _click_first(page, texts, timeout=2500) -> bool:
@@ -61,11 +78,19 @@ def _click_first(page, texts, timeout=2500) -> bool:
 
 
 def main(argv: list[str]) -> int:
-    if not argv:
-        print("Usage: python3 scripts/assisted_fill.py <job_url> [profile_dir]")
-        return 2
-    url = argv[0]
-    profile = argv[1] if len(argv) > 1 else ".coverai-browser/users/julien/smartrecruiters"
+    parser = argparse.ArgumentParser(description="Supervised live fill of a real application form.")
+    parser.add_argument("url", help="the job/apply URL to open")
+    parser.add_argument("--app", default=None, help="application_id in coverai.db (default: most recent)")
+    parser.add_argument("--profile", default=".coverai-browser/users/julien/smartrecruiters",
+                        help="persistent Chromium profile dir (a logged-in/blessed session)")
+    parser.add_argument("--approve", action="store_true",
+                        help="explicit approval to TYPE into the form; without it, only the plan is printed")
+    ns = parser.parse_args(argv)
+    url, profile = ns.url, ns.profile
+
+    packet = _load_packet(ns.app, ns.approve)
+    if not ns.approve:
+        print(">>> DRY RUN (no --approve): I will show the fill plan and type NOTHING.\n", flush=True)
 
     launch_kw = dict(headless=False, ignore_default_args=["--enable-automation"],
                      args=["--disable-blink-features=AutomationControlled", "--start-maximized"])
@@ -109,8 +134,16 @@ def main(argv: list[str]) -> int:
                 print("\n[TIMEOUT] form not reached; nothing filled.")
                 return 1
 
-            print(f"\n[form ready] {len(scan['controls'])} fields. Filling now...\n")
-            record = fill_form(page, PACKET, scan)
+            print(f"\n[form ready] {len(scan['controls'])} fields.\n")
+            if not ns.approve:
+                plan = prepare_autofill(packet, scan)
+                print(">>> FILL PLAN (dry run -- nothing typed):")
+                print(json.dumps(plan, ensure_ascii=False, indent=2))
+                print("\n>>> Re-run with --approve to type these values. Window closes in 20s.\n", flush=True)
+                page.wait_for_timeout(20000)
+                return 0
+            print("Filling now (approved)...\n")
+            record = fill_form(page, packet, scan)
             print(json.dumps(record, ensure_ascii=False, indent=2))
             print("\n>>> Filled. NOTHING was submitted. Look at the window to verify, "
                   "then it will close in 25s.\n", flush=True)

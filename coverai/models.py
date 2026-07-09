@@ -43,6 +43,34 @@ class User(Base):
     updated_at: Mapped[str] = mapped_column(String, nullable=False)
 
 
+class UserProfile(Base):
+    """Reusable identity fields that every application form asks for.
+
+    Separate from `users` (which is auth-ish: role, display_name) because this is
+    the application-facing profile -- the values Helene's autofill types into a
+    real form: name, email, phone, city, country, and public profile links. One
+    row per user (user_id is both PK and FK). This is the future home of Louise
+    (memory.profile); for now it is a plain table the packet producer reads.
+
+    Column names match the frozen LOGICAL_FIELDS vocabulary in browser_apply.py
+    (first_name, location_city, ...) so the producer is a direct copy, no rename.
+    """
+
+    __tablename__ = "user_profile"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    first_name: Mapped[str] = mapped_column(String, nullable=False, server_default="")
+    last_name: Mapped[str] = mapped_column(String, nullable=False, server_default="")
+    email: Mapped[str] = mapped_column(String, nullable=False, server_default="")
+    phone: Mapped[str] = mapped_column(String, nullable=False, server_default="")
+    location_city: Mapped[str] = mapped_column(String, nullable=False, server_default="")
+    location_country: Mapped[str] = mapped_column(String, nullable=False, server_default="")
+    linkedin_url: Mapped[str] = mapped_column(String, nullable=False, server_default="")
+    portfolio_url: Mapped[str] = mapped_column(String, nullable=False, server_default="")
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+    updated_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class Platform(Base):
     __tablename__ = "platforms"
 
@@ -212,6 +240,38 @@ class ApplicationQuestion(Base):
     answer_source: Mapped[str] = mapped_column(String, nullable=False, server_default="unknown")
     confidence: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     status: Mapped[str] = mapped_column(String, nullable=False, server_default="detected")
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+    updated_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class InterviewQuestion(Base):
+    """A likely interview question for a specific offer, in the Helene->Camille seam.
+
+    Helene (browser) COLLECTS the question from a job board and stores it (status
+    'collected', source names where it came from). Camille (coach) then drafts a
+    job-specific suggested_answer with AI (status 'coached'). The user refines it
+    into `answer` (status 'answered'). One row per (offer, question).
+
+    Deliberately separate from application_questions: those are form fields to
+    submit; these are interview prep. Different lifecycle, different owner.
+    """
+
+    __tablename__ = "interview_questions"
+    __table_args__ = (Index("idx_interview_questions_offer", "offer_id", "status"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id"), nullable=False, server_default=DEFAULT_USER_ID
+    )
+    offer_id: Mapped[str] = mapped_column(ForeignKey("offers.id"), nullable=False)
+    category: Mapped[str] = mapped_column(String, nullable=False, server_default="general")
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(String, nullable=False, server_default="unknown")
+    suggested_answer: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    answer: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    answer_source: Mapped[str] = mapped_column(String, nullable=False, server_default="unknown")
+    confidence: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    status: Mapped[str] = mapped_column(String, nullable=False, server_default="collected")
     created_at: Mapped[str] = mapped_column(String, nullable=False)
     updated_at: Mapped[str] = mapped_column(String, nullable=False)
 

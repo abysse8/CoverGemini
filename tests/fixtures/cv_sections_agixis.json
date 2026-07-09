@@ -1,0 +1,17 @@
+{
+  "company": "Agixis",
+  "role_title": "Ingénieur Systèmes Embarqués (Alternance)",
+  "objective": "Alternance en systèmes embarqués et IA appliquée, pour concevoir des firmwares robustes et instrumentés.",
+  "apl_items": [
+    "Développé un pipeline de traitement du signal temps réel en C sur STM32.",
+    "Implémenté un filtre de Kalman pour la fusion de capteurs inertiels.",
+    "Réduit la consommation d'un noeud capteur autonome sur bus RS485."
+  ],
+  "skills": {
+    "languages": ["C", "C++", "Python"],
+    "embedded": ["STM32", "FreeRTOS", "RS485", "ESP32"],
+    "tools": ["Git", "PlatformIO", "Oscilloscope"]
+  },
+  "letter": "Madame, Monsieur, votre offre d'alternance retient toute mon attention. (Paragraphe 1.)\n\n(Paragraphe 2.)\n\n(Paragraphe 3.)",
+  "notes": ["Disponible a partir de septembre 2026"]
+}
