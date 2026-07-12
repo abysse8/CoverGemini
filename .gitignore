@@ -15,3 +15,6 @@ venv/
 *.jpeg
 *.png
 .coverage
+
+# Database backups (renamed copies escape the *.db pattern)
+coverai.db.*
